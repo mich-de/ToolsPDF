@@ -90,10 +90,6 @@ registro_codebase:
       file: "release.ps1"
       responsabilita: "pubblica una versione: controlla git pulito e versione nuova, test, build, version.txt con impronta, gh release create vX.Y.Z"
       funzioni_chiave: []
-    - nome: "versione Go (1MbPDF, non piu' sviluppata)"
-      file: "main.go, internal/"
-      responsabilita: "prima versione: solo compressione"
-      funzioni_chiave: []
 
   funzioni_utility:
     - nome: "format_mb"
@@ -124,7 +120,8 @@ registro_codebase:
     - percorso: "D:/ToolsPDF_prova"
       motivo: "cartella delle prove: solo copie e risultati di prova, da eliminare a mano"
       tag: "[TEMPORANEO]"
-  file_eliminati_ultima_sessione: []
+  file_eliminati_ultima_sessione:
+    - "main.go, go.mod, go.sum, internal/" # prima versione in Go, cancellata su richiesta dell'utente (9 nov); resta nella storia git (commit 55fed3c)
 
   gitignore_pattern_aggiunti: []
 

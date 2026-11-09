@@ -39,5 +39,3 @@ Struttura del codice e decisioni: [REGISTRO.md](REGISTRO.md).
 
 1. Alzare `version` in `rust/Cargo.toml` e fare commit e push.
 2. `powershell -File release.ps1 -Notes "cosa cambia"`: test, build, `version.txt` con l'impronta, release `vX.Y.Z` su GitHub.
-
-La cartella `internal/` e `main.go` sono la prima versione in Go (solo compressione), non piu' sviluppata.
