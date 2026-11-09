@@ -1,0 +1,11 @@
+# Compilazione
+rust/target/
+
+# Eseguibili: si pubblicano come release, non nel codice
+*.exe
+*.exe.new
+*.exe.old
+
+# Preferenze personali e note di lavoro locali
+ToolsPDF.ini
+HANDOFF.md
