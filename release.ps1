@@ -35,8 +35,13 @@ $built = Join-Path $rust "target\x86_64-pc-windows-gnullvm\release\toolspdf.exe"
 $out = Join-Path $rust "target\release-assets"
 New-Item -ItemType Directory -Force $out | Out-Null
 $exe = Join-Path $out "ToolsPDF.exe"
-Copy-Item $built $exe -Force
-Copy-Item $built (Join-Path $root "ToolsPDF.exe") -Force
+Copy-Item $built $exe -Force -ErrorAction Stop
+# La copia accanto al progetto fallisce se quella barra e' aperta: non blocca la release.
+try {
+    Copy-Item $built (Join-Path $root "ToolsPDF.exe") -Force -ErrorAction Stop
+} catch {
+    Write-Warning "ToolsPDF.exe del progetto in uso: non aggiornato. Chiudere la barra e ricopiare da $exe"
+}
 $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 $versionFile = Join-Path $out "version.txt"
 [IO.File]::WriteAllText($versionFile, "$version`r`n$hash`r`n")
