@@ -15,7 +15,7 @@ use super::drop_target::{self, Target};
 use super::paint::{client_rect, draw_text, fill_rect, fill_round_rect, line, outline, paint_button, text_height, with_pen, MARGIN};
 use super::tools_panel::{self, ToolsHit, DROP_FILE, DROP_SIGNATURE};
 use super::win::{rect, wide, Cell2, RectExt};
-use super::{high_word, low_word, main_hwnd, monitors, scale, with_tray, Ui, APP_TITLE, BUILD_DATE, UI, VERSION, ZONE_JOIN, ZONE_TOOLS};
+use super::{high_word, low_word, main_hwnd, monitors, scale, with_tray, Ui, APP_TITLE, AUTHOR, BUILD_DATE, UI, VERSION, ZONE_JOIN, ZONE_TOOLS};
 use crate::settings::{self, Conversion, Settings, Side, Theme, LIMITS_MB};
 use crate::tools::preview::Thumb;
 use crate::tools::Source;
@@ -57,6 +57,20 @@ enum Hit {
     Clear,
     Choice(usize, usize),
     Save,
+    /// Indirizzo del progetto nel pannello Info.
+    Link,
+}
+
+fn web_address() -> String {
+    format!("https://github.com/{}", crate::update::REPO)
+}
+
+/// Riga del link in Info: sotto titolo, versione e autore, che hanno altezza fissa.
+fn link_rect(hwnd: HWND, ui: &Ui) -> RECT {
+    let s = |v| scale(ui, v);
+    let client = client_rect(hwnd);
+    let top = s(HEADER) + s(14) + s(20) + 2 * s(18);
+    rect(s(MARGIN), top, client.right - s(MARGIN), top + s(18))
 }
 
 struct Panel {
@@ -435,6 +449,7 @@ fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Hit {
             }
             Hit::Nothing
         }
+        Mode::Info if link_rect(hwnd, ui).contains(x, y) => Hit::Link,
         _ => Hit::Nothing,
     }
 }
@@ -487,7 +502,7 @@ fn paint(hwnd: HWND, ui: &Ui) {
                 tools_panel::paint(dc, hwnd, ui, client, hover, drop);
             }
             Mode::Join => paint_join(dc, hwnd, ui, client),
-            Mode::Info => paint_info(dc, ui, client),
+            Mode::Info => paint_info(dc, hwnd, ui, client),
             Mode::Settings => paint_settings(dc, hwnd, ui, client),
             Mode::Hidden => {}
         }
@@ -707,14 +722,31 @@ pub(super) fn paint_remove(dc: HDC, ui: &Ui, r: RECT, hover: bool) {
     });
 }
 
-fn paint_info(dc: HDC, ui: &Ui, client: RECT) {
+fn paint_info(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
     let s = |v| scale(ui, v);
     let colors = ui.palette.get();
     let fonts = ui.fonts.get();
     let width = client.right - 2 * s(MARGIN);
     let settings_file = settings::file_path().map_or_else(|| "non disponibile".to_string(), |p| p.display().to_string());
-    let paragraphs: [(&str, String); 9] = [
-        ("Tools PDF", format!("Versione {VERSION}, compilata il {BUILD_DATE}.")),
+
+    // Intestazione ad altezza fissa: link_rect conta su queste righe.
+    let line_flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
+    let mut y = s(HEADER) + s(14);
+    draw_text(dc, "Tools PDF", rect(s(MARGIN), y, client.right - s(MARGIN), y + s(20)), fonts.body_bold, colors.fg, DT_SINGLELINE | DT_NOPREFIX);
+    y += s(20);
+    for text in [format!("Versione {VERSION}, compilata il {BUILD_DATE}."), format!("di {AUTHOR}")] {
+        draw_text(dc, &text, rect(s(MARGIN), y, client.right - s(MARGIN), y + s(18)), fonts.small, colors.muted, line_flags);
+        y += s(18);
+    }
+    let link = link_rect(hwnd, ui);
+    let hover = PANEL.with(|p| p.hover.get()) == Hit::Link;
+    if hover {
+        fill_round_rect(dc, rect(link.left - s(4), link.top, link.right, link.bottom), s(4), colors.tint);
+    }
+    draw_text(dc, &web_address(), link, fonts.small, colors.primary, line_flags);
+    y = link.bottom + s(12);
+
+    let paragraphs: [(&str, String); 8] = [
         ("Comprimi", format!("Porta PDF, immagini, Word ed Excel sotto {}.", crate::tools::limit_label())),
         ("Dividi", "Crea la cartella nome_pagine con un PDF per pagina, ognuno nel limite.".into()),
         (
@@ -742,7 +774,6 @@ fn paint_info(dc: HDC, ui: &Ui, client: RECT) {
             ),
         ),
     ];
-    let mut y = s(HEADER) + s(14);
     for (heading, body) in paragraphs {
         draw_text(dc, heading, rect(s(MARGIN), y, client.right - s(MARGIN), y + s(20)), fonts.body_bold, colors.fg, DT_SINGLELINE | DT_NOPREFIX);
         y += s(20);
@@ -811,6 +842,7 @@ fn on_click(hwnd: HWND, hit: Hit) {
             });
         }
         Hit::Save => save_settings(),
+        Hit::Link => super::open_web(&web_address()),
         Hit::Row(_) | Hit::Nothing => {}
     }
     unsafe { InvalidateRect(hwnd, null(), 0) };

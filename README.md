@@ -1,6 +1,6 @@
 # Tools PDF
 
-Barra laterale per Windows, portable: un solo `ToolsPDF.exe`, nessuna installazione, solo DLL di sistema.
+Di Michele De Angelis. Barra laterale per Windows, portable: un solo `ToolsPDF.exe`, nessuna installazione, solo DLL di sistema.
 Si trascinano i file sulle zone della barra.
 
 | Zona | Cosa fa |

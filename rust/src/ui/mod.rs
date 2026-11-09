@@ -46,6 +46,7 @@ const LOGICAL_WIDTH: i32 = 220;
 pub(crate) const APP_TITLE: &str = "Tools PDF";
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const BUILD_DATE: &str = env!("TOOLSPDF_BUILD_DATE");
+pub(crate) const AUTHOR: &str = "Michele De Angelis";
 const WM_APPBAR_NOTIFY: u32 = WM_APP + 1;
 const WM_REPAINT: u32 = WM_APP + 2;
 /// wparam 0: c'e' una versione nuova da proporre; 1: e' installata, si propone il riavvio.
@@ -764,11 +765,21 @@ pub(crate) fn clear_tray() {
     request_repaint();
 }
 
-/// Apre Esplora file sul risultato. Percorso completo: l'exe portable puo' stare ovunque
+/// explorer.exe con percorso completo: l'exe portable puo' stare ovunque
 /// e non deve mai avviare un explorer.exe trovato nella sua cartella.
-fn reveal(path: &Path, is_folder: bool) {
+fn explorer() -> Command {
     let windows_dir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let mut command = Command::new(windows_dir.join("explorer.exe"));
+    Command::new(windows_dir.join("explorer.exe"))
+}
+
+/// Apre un indirizzo web nel browser predefinito.
+pub(crate) fn open_web(url: &str) {
+    let _ = explorer().arg(url).spawn();
+}
+
+/// Apre Esplora file sul risultato.
+fn reveal(path: &Path, is_folder: bool) {
+    let mut command = explorer();
     if is_folder {
         command.arg(path);
     } else {
