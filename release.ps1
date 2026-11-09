@@ -4,7 +4,9 @@
 # Esegue i test, compila, scrive version.txt (versione + SHA-256 dell'exe) e crea la release vX.Y.Z.
 # Le barre gia' installate leggono version.txt dall'ultima release e propongono l'aggiornamento.
 param([string]$Notes = "")
-$ErrorActionPreference = "Stop"
+# Non "Stop": in PowerShell 5.1 cargo, git e gh scrivono su stderr anche quando riescono.
+# Gli errori si controllano con $LASTEXITCODE.
+$ErrorActionPreference = "Continue"
 
 $repo = "mich-de/ToolsPDF"
 $root = $PSScriptRoot
@@ -41,6 +43,7 @@ $versionFile = Join-Path $out "version.txt"
 
 if (-not $Notes) { $Notes = "Tools PDF $version" }
 git -C $root push
+if ($LASTEXITCODE -ne 0) { throw "git push non riuscito." }
 gh release create "v$version" $exe $versionFile --repo $repo --title "Tools PDF $version" --notes $Notes
 if ($LASTEXITCODE -ne 0) { throw "Creazione della release non riuscita." }
 Write-Output "Pubblicata v$version (SHA-256 $hash)"
