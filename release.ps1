@@ -3,7 +3,9 @@
 #   powershell -File release.ps1 -Notes "cosa cambia"
 # Esegue i test, compila, scrive version.txt (versione + SHA-256 dell'exe) e crea la release vX.Y.Z.
 # Le barre gia' installate leggono version.txt dall'ultima release e propongono l'aggiornamento.
-param([string]$Notes = "")
+# Solo test, compilazione e copia accanto al progetto, senza pubblicare:
+#   powershell -File release.ps1 -BuildOnly
+param([string]$Notes = "", [switch]$BuildOnly)
 # Non "Stop": in PowerShell 5.1 cargo, git e gh scrivono su stderr anche quando riescono.
 # Gli errori si controllano con $LASTEXITCODE.
 $ErrorActionPreference = "Continue"
@@ -17,9 +19,18 @@ $version = $match.Matches[0].Groups[1].Value
 $llvm = Get-ChildItem (Join-Path $env:USERPROFILE ".llvm-mingw") -Directory | Select-Object -First 1
 $env:PATH = (Join-Path $env:USERPROFILE ".cargo\bin") + ";" + (Join-Path $llvm.FullName "bin") + ";" + $env:PATH
 
-if (git -C $root status --porcelain) { throw "Ci sono modifiche non salvate in git: fare commit prima della release." }
-gh release view "v$version" --repo $repo 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) { throw "La release v$version esiste gia': alzare la versione in rust/Cargo.toml." }
+# Nessun percorso del PC di chi compila nell'exe: le librerie vi lasciano i percorsi dei sorgenti
+# (con il nome utente) per i messaggi interni. Stessi flag di rust/.cargo/config.toml, piu' la
+# rimappatura; la variabile d'ambiente prende il posto dei flag del file di configurazione.
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+$flags = @("-C", "target-feature=+crt-static", "-C", "link-arg=-static", "--remap-path-prefix=$cargoHome=cargo", "--remap-path-prefix=$root=src", "--remap-path-prefix=$env:USERPROFILE=user")
+$env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]0x1f
+
+if (-not $BuildOnly) {
+    if (git -C $root status --porcelain) { throw "Ci sono modifiche non salvate in git: fare commit prima della release." }
+    gh release view "v$version" --repo $repo 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { throw "La release v$version esiste gia': alzare la versione in rust/Cargo.toml." }
+}
 
 Push-Location $rust
 try {
@@ -32,6 +43,10 @@ try {
 }
 
 $built = Join-Path $rust "target\x86_64-pc-windows-gnullvm\release\toolspdf.exe"
+# Controllo finale: il nome utente non deve comparire nell'exe.
+$bytes = [IO.File]::ReadAllBytes($built)
+$text = [Text.Encoding]::ASCII.GetString($bytes)
+if ($text.Contains($env:USERNAME)) { throw "L'exe contiene ancora il nome utente $($env:USERNAME): controllare --remap-path-prefix." }
 $out = Join-Path $rust "target\release-assets"
 New-Item -ItemType Directory -Force $out | Out-Null
 $exe = Join-Path $out "ToolsPDF.exe"
@@ -41,6 +56,10 @@ try {
     Copy-Item $built (Join-Path $root "ToolsPDF.exe") -Force -ErrorAction Stop
 } catch {
     Write-Warning "ToolsPDF.exe del progetto in uso: non aggiornato. Chiudere la barra e ricopiare da $exe"
+}
+if ($BuildOnly) {
+    Write-Output "Compilato $version senza pubblicare: $exe"
+    return
 }
 $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 $versionFile = Join-Path $out "version.txt"

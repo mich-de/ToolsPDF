@@ -1,6 +1,6 @@
 //! Pannello accanto alla barra: lista di Unisci con anteprime, Strumenti, Info, Impostazioni.
 //! Stesso thread e stessi colori della barra; si apre sul lato libero dello schermo.
-//! La parte Strumenti sta in tools_panel.rs.
+//! La parte Strumenti sta in tools_panel.rs, la parte Firme in signatures_panel.rs.
 
 use std::cell::RefCell;
 use std::mem::size_of;
@@ -12,11 +12,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::drop_target::{self, Target};
-use super::paint::{client_rect, draw_text, fill_rect, fill_round_rect, line, outline, paint_button, text_height, with_pen, MARGIN};
+use super::paint::{bgra_info, client_rect, draw_text, fill_rect, fill_round_rect, line, outline, paint_button, text_height, with_pen, MARGIN};
+use super::signatures_panel::{self, SigHit, DROP_IMAGE};
 use super::tools_panel::{self, ToolsHit, DROP_FILE, DROP_SIGNATURE};
 use super::win::{rect, wide, Cell2, RectExt};
 use super::{high_word, low_word, main_hwnd, monitors, scale, with_tray, Ui, APP_TITLE, AUTHOR, BUILD_DATE, UI, VERSION, ZONE_JOIN, ZONE_TOOLS};
-use crate::settings::{self, Conversion, Settings, Side, Theme, LIMITS_MB};
+use std::path::PathBuf;
+
+use crate::settings::{self, Conversion, Save, Settings, Side, Theme, LIMITS_MB};
 use crate::tools::preview::Thumb;
 use crate::tools::Source;
 
@@ -33,6 +36,9 @@ const COLUMNS: i32 = 3;
 const GAP: i32 = 8;
 const PAGES_LABEL: i32 = 30;
 const GROUP_STEP: i32 = 66;
+/// Riga della cartella fissa sotto "Dove salvare": sposta in giu' i gruppi successivi.
+const FOLDER_ROW: i32 = 34;
+const SAVE_GROUP: usize = 1;
 const DRAG_THRESHOLD: i32 = 5;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -40,6 +46,7 @@ pub(crate) enum Mode {
     Hidden,
     Join,
     Tools,
+    Signatures,
     Info,
     Settings,
 }
@@ -47,6 +54,7 @@ pub(crate) enum Mode {
 #[derive(Clone, Copy, PartialEq)]
 enum Hit {
     Tools(ToolsHit),
+    Signatures(SigHit),
     Nothing,
     Close,
     Row(usize),
@@ -56,6 +64,8 @@ enum Hit {
     Join,
     Clear,
     Choice(usize, usize),
+    /// Tasto Cambia… della cartella fissa.
+    Folder,
     Save,
     /// Indirizzo del progetto nel pannello Info.
     Link,
@@ -87,6 +97,8 @@ struct Panel {
     /// Zona sotto un file trascinato sul pannello.
     drop_zone: Cell2<Option<usize>>,
     draft: Cell2<Settings>,
+    /// Cartella fissa in modifica, salvata con Salva.
+    draft_folder: RefCell<Option<PathBuf>>,
     note: RefCell<String>,
 }
 
@@ -103,6 +115,7 @@ thread_local! {
         drop_at: Cell2::new(None),
         drop_zone: Cell2::new(None),
         draft: Cell2::new(Settings::default()),
+        draft_folder: RefCell::new(None),
         note: RefCell::new(String::new()),
     };
 }
@@ -110,10 +123,10 @@ thread_local! {
 /// Voci fisse delle impostazioni; l'ultima, Schermo, dipende dagli schermi collegati.
 const FIXED_GROUPS: [(&str, &[&str]); 6] = [
     ("Limite di peso", &["1 MB", "2 MB", "5 MB", "10 MB"]),
-    ("Dove salvare", &["Accanto all'originale", "Chiedi sempre"]),
+    ("Dove salvare", &["Accanto all'orig.", "Cartella fissa", "Chiedi sempre"]),
     ("Conversione in immagini", &["Chiedi", "Sempre", "Mai"]),
     ("OCR", &["In tutte le zone", "Solo zona Testo"]),
-    ("Lato della barra", &["Destra", "Sinistra"]),
+    ("Lato della barra", &["← Sinistra", "Destra →"]),
     ("Tema", &["Come Windows", "Chiaro", "Scuro"]),
 ];
 const SCREEN_GROUP: usize = FIXED_GROUPS.len();
@@ -134,14 +147,18 @@ fn choice_of(settings: &Settings, group: usize) -> usize {
     }
     match group {
         0 => LIMITS_MB.iter().position(|&mb| mb == settings.limit_mb).unwrap_or(0),
-        1 => usize::from(settings.always_ask),
+        1 => match settings.save {
+            Save::Beside => 0,
+            Save::Folder => 1,
+            Save::Ask => 2,
+        },
         2 => match settings.conversion {
             Conversion::Ask => 0,
             Conversion::Always => 1,
             Conversion::Never => 2,
         },
         3 => usize::from(!settings.always_ocr),
-        4 => usize::from(settings.side == Side::Left),
+        4 => usize::from(settings.side == Side::Right),
         _ => match settings.theme {
             Theme::System => 0,
             Theme::Light => 1,
@@ -157,10 +174,10 @@ fn with_choice(mut settings: Settings, group: usize, choice: usize) -> Settings 
     }
     match group {
         0 => settings.limit_mb = LIMITS_MB[choice.min(LIMITS_MB.len() - 1)],
-        1 => settings.always_ask = choice == 1,
+        1 => settings.save = [Save::Beside, Save::Folder, Save::Ask][choice.min(2)],
         2 => settings.conversion = [Conversion::Ask, Conversion::Always, Conversion::Never][choice.min(2)],
         3 => settings.always_ocr = choice == 0,
-        4 => settings.side = if choice == 1 { Side::Left } else { Side::Right },
+        4 => settings.side = if choice == 0 { Side::Left } else { Side::Right },
         _ => settings.theme = [Theme::System, Theme::Light, Theme::Dark][choice.min(2)],
     }
     settings
@@ -204,6 +221,7 @@ pub(crate) fn create(instance: HINSTANCE) -> Result<(), String> {
         }
         PANEL.with(|p| p.hwnd.set(hwnd));
         tools_panel::create_children(hwnd, instance);
+        signatures_panel::create_children(hwnd, instance);
         drop_target::register(hwnd, Target::Panel)?;
     }
     Ok(())
@@ -225,9 +243,12 @@ pub(crate) fn invalidate() {
     }
 }
 
-/// I campi di testo esistono solo nel pannello Strumenti.
+/// Campi di testo: in Strumenti e nella nota delle Firme.
 fn sync_children(hwnd: HWND) {
-    UI.with(|ui| tools_panel::sync_children(hwnd, ui, mode() == Mode::Tools));
+    UI.with(|ui| {
+        tools_panel::sync_children(hwnd, ui, mode() == Mode::Tools);
+        signatures_panel::sync_children(hwnd, ui, mode() == Mode::Signatures);
+    });
 }
 
 /// Zona del pannello sotto un punto dello schermo, durante un trascinamento.
@@ -238,6 +259,7 @@ pub(crate) fn drop_zone_at(x: i32, y: i32) -> Option<usize> {
     match mode() {
         Mode::Tools => Some(UI.with(|ui| tools_panel::drop_zone(hwnd, ui, point.x, point.y))),
         Mode::Join => Some(DROP_JOIN),
+        Mode::Signatures => Some(DROP_IMAGE),
         _ => None,
     }
 }
@@ -255,6 +277,10 @@ pub(crate) fn on_drop(zone: usize, mut sources: Vec<Source>, errors: Vec<(String
             tools_panel::load_signature(sources.remove(0));
             invalidate();
         }
+        DROP_IMAGE if !sources.is_empty() => {
+            signatures_panel::load_dropped(sources.remove(0));
+            invalidate();
+        }
         DROP_JOIN => super::on_drop(ZONE_JOIN, sources, errors),
         DROP_FILE => super::on_drop(ZONE_TOOLS, sources, errors),
         _ => {}
@@ -267,9 +293,13 @@ fn show(mode: Mode) {
         p.hover.set(Hit::Nothing);
         if mode == Mode::Settings {
             p.draft.set(settings::current());
+            *p.draft_folder.borrow_mut() = settings::output_folder();
             p.note.borrow_mut().clear();
         }
     });
+    if mode == Mode::Signatures {
+        signatures_panel::reload();
+    }
     reposition();
     let hwnd = PANEL.with(|p| p.hwnd.get());
     sync_children(hwnd);
@@ -314,6 +344,11 @@ pub(crate) fn show_join(select: Option<u64>) {
 /// Mostra il pannello Strumenti, vuoto o con il documento aperto.
 pub(crate) fn show_tools() {
     show(Mode::Tools);
+}
+
+/// Mostra il pannello Firme: elenco o anteprima della firma appena arrivata.
+pub(crate) fn show_signatures() {
+    show(Mode::Signatures);
 }
 
 /// Il pannello sta sul lato libero della barra, alto quanto lei.
@@ -382,13 +417,28 @@ fn close_rect(hwnd: HWND, ui: &Ui) -> RECT {
     rect(client.right - size - gap, gap, client.right - gap, gap + size)
 }
 
+/// Cima del gruppo di impostazioni: dopo "Dove salvare" c'e' la riga della cartella fissa.
+fn group_top(ui: &Ui, group: usize) -> i32 {
+    let s = |v| scale(ui, v);
+    s(HEADER) + s(12) + group as i32 * s(GROUP_STEP) + if group > SAVE_GROUP { s(FOLDER_ROW) } else { 0 }
+}
+
+/// Riga della cartella fissa: percorso e tasto Cambia….
+fn folder_rects(hwnd: HWND, ui: &Ui) -> (RECT, RECT) {
+    let s = |v| scale(ui, v);
+    let client = client_rect(hwnd);
+    let top = group_top(ui, SAVE_GROUP) + s(24) + s(32) + s(4);
+    let button = rect(client.right - s(MARGIN) - s(84), top, client.right - s(MARGIN), top + s(SMALL_BUTTON));
+    (rect(s(MARGIN) + s(2), top, button.left - s(6), top + s(SMALL_BUTTON)), button)
+}
+
 fn choice_rect(hwnd: HWND, ui: &Ui, group: usize, choice: usize) -> RECT {
     let s = |v| scale(ui, v);
     let client = client_rect(hwnd);
     let count = groups().get(group).map_or(1, |g| g.1.len()).max(1) as i32;
     let left = s(MARGIN);
     let width = (client.right - 2 * s(MARGIN)) / count;
-    let top = s(HEADER) + s(12) + group as i32 * s(GROUP_STEP) + s(24);
+    let top = group_top(ui, group) + s(24);
     let x = left + choice as i32 * width;
     rect(x, top, x + width, top + s(32))
 }
@@ -396,7 +446,7 @@ fn choice_rect(hwnd: HWND, ui: &Ui, group: usize, choice: usize) -> RECT {
 fn save_rect(hwnd: HWND, ui: &Ui) -> RECT {
     let s = |v| scale(ui, v);
     let client = client_rect(hwnd);
-    let top = s(HEADER) + s(12) + (SCREEN_GROUP as i32 + 1) * s(GROUP_STEP) + s(6);
+    let top = group_top(ui, SCREEN_GROUP + 1) + s(6);
     rect(s(MARGIN), top, client.right - s(MARGIN), top + s(36))
 }
 
@@ -406,6 +456,7 @@ fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Hit {
     }
     match mode() {
         Mode::Tools => Hit::Tools(tools_panel::hit_test(hwnd, ui, x, y)),
+        Mode::Signatures => Hit::Signatures(signatures_panel::hit_test(hwnd, ui, x, y)),
         Mode::Join => {
             let count = with_tray(|tray| tray.len()).unwrap_or(0);
             let (join, clear) = footer_buttons(hwnd, ui);
@@ -444,6 +495,9 @@ fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Hit {
                     }
                 }
             }
+            if folder_rects(hwnd, ui).1.contains(x, y) {
+                return Hit::Folder;
+            }
             if save_rect(hwnd, ui).contains(x, y) {
                 return Hit::Save;
             }
@@ -479,6 +533,7 @@ fn paint(hwnd: HWND, ui: &Ui) {
                 n => format!("Unisci {n} file"),
             },
             Mode::Tools => "Strumenti".into(),
+            Mode::Signatures => "Firme".into(),
             Mode::Info => "Informazioni".into(),
             Mode::Settings => "Impostazioni".into(),
             Mode::Hidden => String::new(),
@@ -500,6 +555,11 @@ fn paint(hwnd: HWND, ui: &Ui) {
                 let (hover, drop) = PANEL.with(|p| (p.hover.get(), p.drop_zone.get()));
                 let hover = if let Hit::Tools(hit) = hover { hit } else { ToolsHit::Nothing };
                 tools_panel::paint(dc, hwnd, ui, client, hover, drop);
+            }
+            Mode::Signatures => {
+                let (hover, drop) = PANEL.with(|p| (p.hover.get(), p.drop_zone.get()));
+                let hover = if let Hit::Signatures(hit) = hover { hit } else { SigHit::Nothing };
+                signatures_panel::paint(dc, hwnd, ui, client, hover, drop == Some(DROP_IMAGE));
             }
             Mode::Join => paint_join(dc, hwnd, ui, client),
             Mode::Info => paint_info(dc, hwnd, ui, client),
@@ -662,22 +722,7 @@ pub(super) fn draw_thumb(dc: HDC, ui: &Ui, thumb: &Thumb, area: RECT) {
     let ratio = (box_w as f64 / thumb.width as f64).min(box_h as f64 / thumb.height as f64);
     let (w, h) = ((thumb.width as f64 * ratio) as i32, (thumb.height as f64 * ratio) as i32);
     let (x, y) = (area.left + (box_w - w) / 2, area.top + (box_h - h) / 2);
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: thumb.width as i32,
-            biHeight: -(thumb.height as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
-        },
-        bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
-    };
+    let info = bgra_info(thumb.width as i32, thumb.height as i32);
     unsafe {
         SetStretchBltMode(dc, HALFTONE);
         SetBrushOrgEx(dc, 0, 0, null_mut());
@@ -746,7 +791,7 @@ fn paint_info(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
     draw_text(dc, &web_address(), link, fonts.small, colors.primary, line_flags);
     y = link.bottom + s(12);
 
-    let paragraphs: [(&str, String); 8] = [
+    let paragraphs: [(&str, String); 10] = [
         ("Comprimi", format!("Porta PDF, immagini, Word ed Excel sotto {}.", crate::tools::limit_label())),
         ("Dividi", "Crea la cartella nome_pagine con un PDF per pagina, ognuno nel limite.".into()),
         (
@@ -761,10 +806,14 @@ fn paint_info(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
             "Strumenti",
             "Ruota, estrai o elimina pagine; aggiunge numeri, timbro, firma o password e salva tutto in nome_modificato.pdf. Pagine anche in JPG.".into(),
         ),
+        (
+            "Firme",
+            "Cattura una firma dallo schermo o da una foto: diventa nera su sfondo trasparente. Clic per copiarla, trascinala nel documento o usala in Strumenti.".into(),
+        ),
         ("Unisci", "Raccogli i file anche da email diverse, ordinali qui e premi Unisci.".into()),
         (
             "Dove salva",
-            "Accanto al file originale. Per gli allegati di Outlook e i file nelle cartelle temporanee chiede sempre dove salvare: niente finisce in una cartella temporanea.".into(),
+            "Accanto al file originale, oppure sempre in una cartella fissa scelta nelle Impostazioni. Senza cartella fissa, per gli allegati di Outlook e i file nelle cartelle temporanee chiede dove salvare: niente finisce in una cartella temporanea.".into(),
         ),
         (
             "Riservatezza",
@@ -772,6 +821,10 @@ fn paint_info(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
                 "I documenti restano su questo PC: nessun file viene inviato in rete. Unico accesso a internet: il controllo delle versioni nuove su github.com/{} (si spegne con aggiornamenti=mai). Impostazioni in {settings_file}.",
                 crate::update::REPO
             ),
+        ),
+        (
+            "Crediti",
+            "Scritte dei moduli lette con ocrs (MIT/Apache-2.0). Modelli: Ocrs models (github.com/robertknight/ocrs-models), addestrati sul dataset HierText di Google Research, licenza CC BY-SA 4.0.".into(),
         ),
     ];
     for (heading, body) in paragraphs {
@@ -790,7 +843,7 @@ fn paint_settings(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
     let draft = PANEL.with(|p| p.draft.get());
     let hover = PANEL.with(|p| p.hover.get());
     for (group, (label, choices)) in groups().iter().enumerate() {
-        let top = s(HEADER) + s(12) + group as i32 * s(GROUP_STEP);
+        let top = group_top(ui, group);
         draw_text(dc, label, rect(s(MARGIN), top, client.right - s(MARGIN), top + s(22)), fonts.body_bold, colors.fg, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         let chosen = choice_of(&draft, group);
         for (choice, text) in choices.iter().enumerate() {
@@ -803,13 +856,28 @@ fn paint_settings(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
             draw_text(dc, text, inner, fonts.small, color, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         }
     }
+    let folder = PANEL.with(|p| p.draft_folder.borrow().clone());
+    let (path_box, change) = folder_rects(hwnd, ui);
+    let (path_text, path_color) = match &folder {
+        Some(path) => (format!("📁 {}", path.display()), if draft.save == Save::Folder { colors.fg } else { colors.muted }),
+        None => ("📁 Nessuna cartella fissa scelta".to_string(), colors.muted),
+    };
+    draw_text(dc, &path_text, path_box, fonts.small, path_color, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
+    paint_button(dc, ui, change, "Cambia…", true, false, hover == Hit::Folder);
+
     let save = save_rect(hwnd, ui);
-    let changed = draft != settings::current();
+    let changed = draft != settings::current() || folder != settings::output_folder();
     paint_button(dc, ui, save, "Salva", changed, true, hover == Hit::Save);
     let note = PANEL.with(|p| p.note.borrow().clone());
-    let hint = "Da Outlook e dalle cartelle temporanee chiede sempre dove salvare. Schermo automatico: il bordo esterno del desktop sul lato scelto.";
+    let hint = "Cartella fissa: tutti i file prodotti, anche dagli allegati di Outlook, finiscono lì senza domande. Altrimenti da Outlook e dalle cartelle temporanee chiede sempre dove salvare. Schermo automatico: il bordo esterno del desktop sul lato scelto.";
+    // Firme e impostazioni stanno accanto all'exe: su OneDrive seguono l'utente su un altro PC.
+    let (cloud, cloud_color) = if settings::on_onedrive() {
+        ("✓ Firme e impostazioni sono su OneDrive: ti seguono se cambi computer.", colors.ok)
+    } else {
+        ("Consiglio: metti ToolsPDF.exe in una cartella tutta sua su OneDrive (es. OneDrive\\ToolsPDF). Firme e impostazioni si salvano accanto all'exe: cambiando computer ritrovi tutto.", colors.muted)
+    };
     let mut y = save.bottom + s(10);
-    for (text, color) in [(note.as_str(), colors.ok), (hint, colors.muted)] {
+    for (text, color) in [(note.as_str(), colors.ok), (hint, colors.muted), (cloud, cloud_color)] {
         if text.is_empty() {
             continue;
         }
@@ -829,6 +897,11 @@ fn on_click(hwnd: HWND, hit: Hit) {
             PANEL.with(|p| p.hover.set(Hit::Nothing));
             sync_children(hwnd);
         }
+        Hit::Signatures(hit) => {
+            signatures_panel::on_click(hwnd, hit);
+            PANEL.with(|p| p.hover.set(Hit::Nothing));
+            sync_children(hwnd);
+        }
         Hit::Close => hide(),
         Hit::Up(index) => super::tray_move(index, index - 1),
         Hit::Down(index) => super::tray_move(index, index + 2),
@@ -836,10 +909,21 @@ fn on_click(hwnd: HWND, hit: Hit) {
         Hit::Join => super::start_join(),
         Hit::Clear => super::clear_tray(),
         Hit::Choice(group, choice) => {
+            // Cartella fissa senza cartella: la si sceglie subito; annullando non cambia nulla.
+            let missing = PANEL.with(|p| p.draft_folder.borrow().is_none());
+            if group == SAVE_GROUP && choice == 1 && missing && !pick_output(hwnd) {
+                unsafe { InvalidateRect(hwnd, null(), 0) };
+                return;
+            }
             PANEL.with(|p| {
                 p.draft.set(with_choice(p.draft.get(), group, choice));
                 p.note.borrow_mut().clear();
             });
+        }
+        Hit::Folder => {
+            if pick_output(hwnd) {
+                PANEL.with(|p| p.draft.set(with_choice(p.draft.get(), SAVE_GROUP, 1)));
+            }
         }
         Hit::Save => save_settings(),
         Hit::Link => super::open_web(&web_address()),
@@ -848,13 +932,24 @@ fn on_click(hwnd: HWND, hit: Hit) {
     unsafe { InvalidateRect(hwnd, null(), 0) };
 }
 
+/// Dialogo della cartella fissa; vero se scelta (resta in bozza fino a Salva).
+fn pick_output(hwnd: HWND) -> bool {
+    let Some(folder) = super::dialogs::pick_output_folder(hwnd) else { return false };
+    PANEL.with(|p| {
+        *p.draft_folder.borrow_mut() = Some(folder);
+        p.note.borrow_mut().clear();
+    });
+    true
+}
+
 fn save_settings() {
     let draft = PANEL.with(|p| p.draft.get());
+    let folder = PANEL.with(|p| p.draft_folder.borrow().clone());
     let previous = settings::current();
-    if draft == previous {
+    if draft == previous && folder == settings::output_folder() {
         return;
     }
-    let note = match settings::save(draft) {
+    let note = match settings::save(draft, folder) {
         Ok(path) => format!("Impostazioni salvate in {}.", path.display()),
         Err(error) => format!("Attive fino alla chiusura, ma non salvate: {error}"),
     };
@@ -882,7 +977,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
             // Il pannello non ruba lo stato attivo alla finestra su cui si sta lavorando,
             // salvo quando si clicca un campo di testo: per scrivere serve.
             WM_MOUSEACTIVATE => {
-                let activate = if tools_panel::edit_under_cursor() { MA_ACTIVATE } else { MA_NOACTIVATE };
+                let activate = if tools_panel::edit_under_cursor() || signatures_panel::edit_under_cursor() { MA_ACTIVATE } else { MA_NOACTIVATE };
                 return activate as LRESULT;
             }
             WM_CTLCOLOREDIT => return UI.with(|ui| tools_panel::edit_colors(wparam as HDC, ui)),
@@ -902,6 +997,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                     TrackMouseEvent(&mut track);
                 }
                 UI.with(|ui| {
+                    if mode() == Mode::Signatures && signatures_panel::mouse_move(hwnd, ui, x, y) {
+                        return;
+                    }
                     if let Some((_, start_y)) = PANEL.with(|p| p.press.get()) {
                         if (y - start_y).abs() > DRAG_THRESHOLD || PANEL.with(|p| p.drop_at.get()).is_some() {
                             let count = with_tray(|tray| tray.len()).unwrap_or(0);
@@ -927,6 +1025,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                 return 0;
             }
             WM_LBUTTONDOWN => {
+                if mode() == Mode::Signatures && UI.with(|ui| signatures_panel::mouse_down(hwnd, ui, low_word(lparam), high_word(lparam))) {
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
                 let hit = UI.with(|ui| hit_test(hwnd, ui, low_word(lparam), high_word(lparam)));
                 if let Hit::Row(index) = hit {
                     PANEL.with(|p| p.press.set(Some((index, high_word(lparam)))));
@@ -935,6 +1037,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                 return 0;
             }
             WM_LBUTTONUP => {
+                if mode() == Mode::Signatures && UI.with(|ui| signatures_panel::mouse_up(hwnd, ui)) {
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
                 let pressed = PANEL.with(|p| p.press.replace(None));
                 let dropped = PANEL.with(|p| p.drop_at.replace(None));
                 if pressed.is_some() {
@@ -954,6 +1060,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                 InvalidateRect(hwnd, null(), 0);
                 return 0;
             }
+            WM_RBUTTONUP => {
+                if mode() == Mode::Signatures {
+                    UI.with(|ui| signatures_panel::context_menu(hwnd, ui, low_word(lparam), high_word(lparam)));
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                return 0;
+            }
             WM_MOUSEWHEEL => {
                 let delta = high_word(wparam as isize);
                 let mut point = POINT { x: low_word(lparam), y: high_word(lparam) };
@@ -964,6 +1077,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                     PANEL.with(|p| {
                         if p.mode.get() == Mode::Tools {
                             tools_panel::scroll(step);
+                        } else if p.mode.get() == Mode::Signatures {
+                            if !signatures_panel::zoom(hwnd, ui, delta, point) {
+                                signatures_panel::scroll(step);
+                            }
                         } else if list_rect(hwnd, ui, count).contains(point.x, point.y) {
                             p.list_scroll.set(p.list_scroll.get() - step);
                         } else {

@@ -1,11 +1,15 @@
 //! Barra laterale in Win32 e GDI: appbar, zone di rilascio, coda di lavoro.
 //! Accanto alla barra si apre il pannello (panel.rs) per Unisci, Info e Impostazioni.
 
+mod capture;
+mod clipboard;
+mod drag_source;
 mod dialogs;
 mod drop_target;
 mod monitors;
 mod paint;
 mod panel;
+mod signatures_panel;
 mod tools_panel;
 mod win;
 
@@ -70,8 +74,9 @@ pub(crate) const ZONE_SPLIT: usize = 1;
 pub(crate) const ZONE_TEXT: usize = 2;
 pub(crate) const ZONE_WORD: usize = 3;
 pub(crate) const ZONE_TOOLS: usize = 4;
-pub(crate) const ZONE_JOIN: usize = 5;
-pub(crate) const ZONE_COUNT: usize = 6;
+pub(crate) const ZONE_SIGNATURES: usize = 5;
+pub(crate) const ZONE_JOIN: usize = 6;
+pub(crate) const ZONE_COUNT: usize = 7;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RowState {
@@ -157,6 +162,7 @@ pub(crate) enum Hover {
     Clear,
     JoinZone,
     ToolsZone,
+    SignaturesZone,
     Folder(usize),
 }
 
@@ -303,7 +309,7 @@ pub fn run(files: Vec<OsString>) {
 
         let mut message: MSG = std::mem::zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
-            if tools_panel::handle_key(&message) {
+            if tools_panel::handle_key(&message) || signatures_panel::handle_key(&message) {
                 continue;
             }
             TranslateMessage(&message);
@@ -576,6 +582,20 @@ pub(crate) fn on_drop(zone: usize, sources: Vec<Source>, errors: Vec<(String, St
             }
         }
         panel::show_tools();
+    } else if zone == ZONE_SIGNATURES {
+        let mut sources = sources.into_iter();
+        if let Some(source) = sources.next() {
+            signatures_panel::load_dropped(source);
+        }
+        for extra in sources {
+            if let Some(row) = new_row(extra.name) {
+                update_row(row, |r| {
+                    r.state = RowState::Failed;
+                    r.status = "Firme prende un'immagine alla volta: trascinala dopo".into();
+                });
+            }
+        }
+        panel::show_signatures();
     } else {
         let op = match zone {
             ZONE_SPLIT => Operation::Split,
@@ -835,9 +855,11 @@ fn process_join(row: usize, sources: Vec<Source>) {
             files.push(file);
         }
         let first_stem = Path::new(&files[0].name).file_stem().map_or_else(|| "documento".to_string(), |s| s.to_string_lossy().into_owned());
-        let keep_beside = !settings::current().always_ask && files.iter().all(saved_outside_temp);
-        let dest = match &files[0].path {
-            Some(path) if keep_beside => Destination::NextTo(path.clone()),
+        let fixed = fixed_folder(&files[0].name);
+        let keep_beside = settings::current().save == settings::Save::Beside && files.iter().all(saved_outside_temp);
+        let dest = match (&files[0].path, fixed) {
+            (_, Some(dest)) => dest,
+            (Some(path), None) if keep_beside => Destination::NextTo(path.clone()),
             _ => {
                 update_row(row, |r| r.status = "Scegli dove salvare".into());
                 let suggested = format!("{first_stem}_unito{}.pdf", tools::limit_suffix());
@@ -856,15 +878,32 @@ fn saved_outside_temp(file: &Loaded) -> bool {
     file.path.as_deref().is_some_and(|path| !location::is_temporary(path))
 }
 
-/// Accanto all'originale, se sta in una cartella normale e le impostazioni lo permettono.
-fn beside(path: Option<&Path>) -> Option<Destination> {
-    path.filter(|p| !settings::current().always_ask && !location::is_temporary(p)).map(|p| Destination::NextTo(p.to_path_buf()))
+/// Dove salvare senza chiedere: nella cartella fissa, se scelta, oppure accanto all'originale
+/// se sta in una cartella normale. None = si chiede.
+fn beside(path: Option<&Path>, name: &str) -> Option<Destination> {
+    match settings::current().save {
+        settings::Save::Folder => fixed_folder(name),
+        settings::Save::Beside => path.filter(|p| !location::is_temporary(p)).map(|p| Destination::NextTo(p.to_path_buf())),
+        settings::Save::Ask => None,
+    }
 }
 
-/// Un file in cartella normale si salva accanto, salvo diversa impostazione;
-/// da Outlook o da una temporanea si chiede sempre dove.
+/// Cartella fissa delle impostazioni, se scelta ed esistente: il file prodotto ci finisce con
+/// lo stesso nome dell'originale piu' il suffisso, senza mai sovrascrivere. Se la cartella
+/// manca (altro PC, OneDrive non sincronizzato) si chiede.
+fn fixed_folder(name: &str) -> Option<Destination> {
+    if settings::current().save != settings::Save::Folder {
+        return None;
+    }
+    let folder = settings::output_folder().filter(|f| f.is_dir() && !location::is_temporary(f))?;
+    let file = Path::new(name).file_name().map_or_else(|| "documento.pdf".into(), |n| n.to_os_string());
+    Some(Destination::NextTo(folder.join(file)))
+}
+
+/// Un file in cartella normale si salva accanto, salvo diversa impostazione (cartella fissa o
+/// chiedi sempre); da Outlook o da una temporanea si chiede, salvo cartella fissa.
 fn destination_for(row: usize, op: Operation, file: &Loaded) -> Result<Destination, ToolError> {
-    if let Some(dest) = beside(file.path.as_deref()) {
+    if let Some(dest) = beside(file.path.as_deref(), &file.name) {
         return Ok(dest);
     }
     update_row(row, |r| r.status = "Scegli dove salvare".into());
@@ -885,7 +924,7 @@ fn process_tools(row: usize, task: ToolsTask, name: &str, path: Option<PathBuf>,
         r.status = "Avvio…".into();
     });
     let result = (|| {
-        let dest = match beside(path.as_deref()) {
+        let dest = match beside(path.as_deref(), name) {
             Some(dest) => dest,
             None => {
                 update_row(row, |r| r.status = "Scegli dove salvare".into());
@@ -1025,6 +1064,9 @@ fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Hover {
     if paint::zone_rect(hwnd, ui, ZONE_TOOLS).contains(x, y) {
         return Hover::ToolsZone;
     }
+    if paint::zone_rect(hwnd, ui, ZONE_SIGNATURES).contains(x, y) {
+        return Hover::SignaturesZone;
+    }
     paint::folder_at(hwnd, ui, x, y).map_or(Hover::Nothing, Hover::Folder)
 }
 
@@ -1045,6 +1087,7 @@ fn on_click(hwnd: HWND, x: i32, y: i32) {
         Hover::Clear => clear_tray(),
         Hover::JoinZone => panel::show_join(None),
         Hover::ToolsZone => panel::toggle(panel::Mode::Tools),
+        Hover::SignaturesZone => panel::toggle(panel::Mode::Signatures),
         Hover::Folder(index) => {
             let output = with_rows(|rows| rows.get(index).and_then(|r| r.output.clone())).flatten();
             if let Some((path, is_folder)) = output {

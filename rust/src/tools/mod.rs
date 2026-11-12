@@ -3,6 +3,7 @@
 
 mod docx;
 pub mod edit;
+mod form_text;
 mod imaging;
 mod join;
 mod keep_text;
@@ -12,6 +13,7 @@ mod office;
 pub mod preview;
 mod pdf_write;
 mod raster;
+pub mod signature;
 mod split;
 mod text_layer;
 mod textize;

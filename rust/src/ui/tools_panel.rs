@@ -12,6 +12,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_RETURN, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use super::signatures_panel::{self, Pick};
 use super::paint::{client_rect, draw_text, fill_rect, fill_round_rect, line, outline, paint_button, with_pen, MARGIN};
 use super::panel::{draw_thumb, paint_placeholder, paint_remove, HEADER};
 use super::win::{rect, wide, Cell2, RectExt};
@@ -182,7 +183,7 @@ fn note(text: &str) {
     TOOLS.with(|t| *t.note.borrow_mut() = text.to_string());
 }
 
-fn get_text(hwnd: HWND) -> String {
+pub(super) fn get_text(hwnd: HWND) -> String {
     unsafe {
         let len = GetWindowTextLengthW(hwnd).max(0) as usize;
         let mut buffer = vec![0u16; len + 1];
@@ -191,7 +192,7 @@ fn get_text(hwnd: HWND) -> String {
     }
 }
 
-fn set_text(hwnd: HWND, text: &str) {
+pub(super) fn set_text(hwnd: HWND, text: &str) {
     let text = wide(text);
     unsafe { SetWindowTextW(hwnd, text.as_ptr()) };
 }
@@ -864,7 +865,7 @@ fn paint_grid(dc: HDC, ui: &Ui, area: RECT, hover: ToolsHit) {
     });
 }
 
-fn paint_field(dc: HDC, ui: &Ui, r: RECT) {
+pub(super) fn paint_field(dc: HDC, ui: &Ui, r: RECT) {
     let colors = ui.palette.get();
     let s = |v| scale(ui, v);
     fill_round_rect(dc, r, s(6), colors.border);
@@ -880,7 +881,7 @@ fn paint_chip(dc: HDC, ui: &Ui, r: RECT, text: &str, selected: bool, hover: bool
         DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
 }
 
-fn paint_check(dc: HDC, ui: &Ui, row: RECT, label: &str, checked: bool, hover: bool) {
+pub(super) fn paint_check(dc: HDC, ui: &Ui, row: RECT, label: &str, checked: bool, hover: bool) {
     let s = |v| scale(ui, v);
     let colors = ui.palette.get();
     if hover {
@@ -984,11 +985,15 @@ pub(super) fn on_click(hit: ToolsHit) {
         ToolsHit::Delete => delete(),
         ToolsHit::Check(index) => toggle_check(index),
         ToolsHit::Preset(index) => set_text(edit_hwnd(E_STAMP), PRESETS[index]),
-        ToolsHit::SigPick => {
-            if let Some(path) = dialogs::pick_image(main_hwnd()) {
-                load_signature(Source::from_path(path));
+        ToolsHit::SigPick => match signatures_panel::pick_for_tools(main_hwnd()) {
+            Pick::Saved(path) => load_signature(Source::from_path(path)),
+            Pick::Other => {
+                if let Some(path) = dialogs::pick_image(main_hwnd()) {
+                    load_signature(Source::from_path(path));
+                }
             }
-        }
+            Pick::Cancel => {}
+        },
         ToolsHit::SigClear => {
             TOOLS.with(|t| *t.signature.borrow_mut() = None);
         }

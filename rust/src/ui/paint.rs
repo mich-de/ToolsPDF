@@ -10,7 +10,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use super::win::{rect, wide, RectExt};
 use super::{
-    panel, scale, tray_len, with_rows, Hover, Row, RowState, Ui, APP_TITLE, VERSION, ZONE_COMPRESS, ZONE_COUNT, ZONE_JOIN, ZONE_SPLIT, ZONE_TEXT, ZONE_TOOLS, ZONE_WORD,
+    panel, scale, tray_len, with_rows, Hover, Row, RowState, Ui, APP_TITLE, VERSION, ZONE_COMPRESS, ZONE_COUNT, ZONE_JOIN, ZONE_SIGNATURES, ZONE_SPLIT, ZONE_TEXT, ZONE_TOOLS, ZONE_WORD,
 };
 use crate::settings::Theme;
 use crate::tools;
@@ -228,6 +228,26 @@ pub(crate) fn folder_at(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Option<usize> {
     .flatten()
 }
 
+/// Intestazione di un'immagine BGRA 32 bit dall'alto in basso, per StretchDIBits e CreateDIBSection.
+pub(crate) fn bgra_info(width: i32, height: i32) -> BITMAPINFO {
+    BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
+    }
+}
+
 /// Esegue draw su un buffer fuori schermo e lo copia in un colpo: niente sfarfallio.
 pub(crate) fn buffered(hwnd: HWND, draw: impl FnOnce(HDC, RECT)) {
     unsafe {
@@ -343,7 +363,8 @@ fn paint_zone(dc: HDC, hwnd: HWND, ui: &Ui, index: usize) {
     let zone = zone_rect(hwnd, ui, index);
     let active = ui.drag_zone.get() == Some(index);
     let hovered = (index == ZONE_JOIN && ui.hover.get() == Hover::JoinZone)
-        || (index == ZONE_TOOLS && (ui.hover.get() == Hover::ToolsZone || panel::mode() == panel::Mode::Tools));
+        || (index == ZONE_TOOLS && (ui.hover.get() == Hover::ToolsZone || panel::mode() == panel::Mode::Tools))
+        || (index == ZONE_SIGNATURES && (ui.hover.get() == Hover::SignaturesZone || panel::mode() == panel::Mode::Signatures));
 
     fill_round_rect(dc, zone, s(8), if active || hovered { colors.tint } else { colors.card });
     let style = if active { PS_SOLID } else { PS_DASH };
@@ -364,6 +385,7 @@ fn paint_zone(dc: HDC, hwnd: HWND, ui: &Ui, index: usize) {
         ZONE_TEXT => ("Testo", "scansioni selezionabili".to_string()),
         ZONE_WORD => ("Word", "PDF e scansioni in docx".to_string()),
         ZONE_TOOLS => ("Strumenti", "ruota, timbro, firma…".to_string()),
+        ZONE_SIGNATURES => ("Firme", "cattura, copia, trascina".to_string()),
         _ => (
             "Unisci",
             match tray {
@@ -441,6 +463,16 @@ fn paint_zone_icon(dc: HDC, ui: &Ui, index: usize, r: RECT) {
                 line(dc, left, y, right, y);
                 let x = r.left + s(knob);
                 line(dc, x, y - s(3), x, y + s(3));
+            }
+        }
+        // Svolazzo di firma su una riga.
+        ZONE_SIGNATURES => {
+            let base = r.bottom - s(4);
+            line(dc, r.left + s(2), base, r.right - s(2), base);
+            let points = [(2, 15), (6, 6), (9, 16), (12, 8), (15, 14), (18, 10), (22, 12)];
+            for pair in points.windows(2) {
+                let ((x1, y1), (x2, y2)) = (pair[0], pair[1]);
+                line(dc, r.left + s(x1), r.top + s(y1), r.left + s(x2), r.top + s(y2));
             }
         }
         // Piu': aggiunta al vassoio.

@@ -1,6 +1,6 @@
 [package]
 name = "toolspdf"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 
 [dependencies]
@@ -9,9 +9,12 @@ getrandom = "0.4"
 hayro = { version = "0.9.0", features = ["embed-fonts"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff", "webp"] }
 lopdf = { version = "0.47.0", default-features = false }
+# OCR delle scritte stampate dei moduli accanto alle firme (Rust puro, modelli in models/ dentro l'exe).
+ocrs = "0.14.0"
+rten = { version = "0.28.0", default-features = false, features = ["onnx_format"] }
 windows = { version = "0.62.2", features = ["Foundation", "Foundation_Collections", "Globalization", "Graphics_Imaging", "Media_Ocr", "Security_Cryptography", "Storage_Streams", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Memory", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_System_WinRT", "Win32_System_DataExchange", "Win32_System_Variant", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_Security"] }
 windows-core = "0.62"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Security", "Win32_Security_Cryptography", "Win32_Networking_WinHttp"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Security", "Win32_Security_Cryptography", "Win32_Networking_WinHttp"] }
 
 [profile.release]
 lto = true

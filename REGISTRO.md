@@ -2,7 +2,7 @@
 
 ```yaml
 registro_codebase:
-  ultimo_aggiornamento: "2026-11-09 (1.1.0: zona Strumenti completa, da provare dal vivo)"
+  ultimo_aggiornamento: "2026-11-12 (gomma magica, ocrs, remap percorsi, consiglio OneDrive, cartella fissa di output); prima 2026-11-11 (1.2.0 Firme: passi 1-9 fatti in locale, da provare dal vivo; release non pubblicata)"
   ultima_pulizia: "2026-11-05"
 
   moduli_esistenti:
@@ -64,12 +64,36 @@ registro_codebase:
       funzioni_chiave: ["load", "save", "save_tools", "current", "tools_prefs", "Settings::parse", "Settings::to_text", "ToolsPrefs::parse", "ToolsPrefs::to_text"]
     - nome: "panel"
       file: "rust/src/ui/panel.rs"
-      responsabilita: "pannello accanto alla barra: lista Unisci ordinabile con anteprime, Strumenti (delegato a tools_panel), Info, Impostazioni; drop target proprio (file -> Strumenti, firma, vassoio Unisci)"
-      funzioni_chiave: ["show_join", "show_tools", "toggle", "hide", "reposition", "drop_zone_at", "set_drop_zone", "on_drop", "paint_join", "paint_settings", "paint_info", "draw_thumb/paint_placeholder/paint_remove (usate da tools_panel)"]
+      responsabilita: "pannello accanto alla barra: lista Unisci ordinabile con anteprime, Strumenti (delegato a tools_panel), Firme (delegato a signatures_panel), Info, Impostazioni; drop target proprio (file -> Strumenti, firma, vassoio Unisci, immagine -> Firme)"
+      funzioni_chiave: ["show_join", "show_tools", "show_signatures", "toggle", "hide", "reposition", "drop_zone_at", "set_drop_zone", "on_drop", "paint_join", "paint_settings", "paint_info", "draw_thumb/paint_placeholder/paint_remove (usate da tools_panel e signatures_panel)"]
     - nome: "tools_panel"
       file: "rust/src/ui/tools_panel.rs"
       responsabilita: "pannello Strumenti: ToolsDoc (stato documento), layout dal basso (miniature nello spazio libero), selezione con Maiusc, rotazione miniature in memoria, sottopannelli Timbro/Firma/Password, 4 campi EDIT Win32 (attivazione solo sui campi, Invio sblocca), Salva/Estrai/JPG in coda"
       funzioni_chiave: ["ToolsDoc", "DocState", "ToolsHit", "layout", "paint", "hit_test", "on_click", "sync_children", "handle_key", "edit_colors", "load_signature", "save", "remember_prefs", "rotate_thumb"]
+    - nome: "signature"
+      file: "rust/src/tools/signature.rs"
+      responsabilita: "firme: da RGB a nero su trasparente (luminanza, carta al 90 percentile, Otsu col centro del vuoto, rampa alfa spostata dallo slider, via le macchioline 8-connesse, ritaglio + margine), PNG, archivio Firme accanto all exe o in AppData (mai temporanee), formati appunti CF_DIBV5 e CF_DIB su bianco"
+      funzioni_chiave: ["decode", "from_bgra", "limit (lato max 1600)", "clean (solo test)", "clean_erased (gomma + origine ritaglio)", "Options {darkness, remove_print, for_print, solid}", "Stroke (magic)", "brush/magic_erase/split_mixed (tubi dei tratti entranti)", "View (fit/zoom_at)", "preview_view", "Prepared/source_rect", "printed_strokes (OCR -> gomma magica)", "prepare(img, options, strokes)", "for_print(img, solid)", "solid_ink", "preview_fit", "remove_lines/remove_dotted_lines/remove_noise (distance_map)", "to_png(img, dpi) + pHYs", "png_dpi", "clean_note/note_of/label", "load", "preview (BGRA su scacchiera, firma centrata)", "DARKNESS_RANGE", "existing_folder", "list", "save", "delete", "dib_v5", "dib_on_white"]
+    - nome: "form_text"
+      file: "rust/src/tools/form_text.rs"
+      responsabilita: "scritte stampate dei moduli accanto alle firme con OCR ocrs (Rust puro, modelli in rust/models dentro l'exe): solo righe con parole dei moduli, tolleranti a errori e tagli"
+      funzioni_chiave: ["printed_boxes", "pick", "split", "known", "distance (Levenshtein)", "KEYWORDS"]
+    - nome: "signatures_panel"
+      file: "rust/src/ui/signatures_panel.rs"
+      responsabilita: "pannello Firme: tasto Cattura, elenco firme salvate su scacchiera (clic = copia, trascinamento = drag_file, tasto destro = Copia/Elimina/Apri cartella), bozza con anteprima, gomma magica e normale (Gomma magica/Gomma/Annulla/Fine, anteprima grande con zoom a rotella, passate in pixel sorgente) e slider piu chiara/piu scura, spunte Rendi nera/Stampa/Togli righe, Salva (salva + appunti)/Scarta; immagine trascinata = bozza; menu firme salvate per Strumenti > Firma"
+      funzioni_chiave: ["SigHit", "reload", "load_dropped", "hit_test", "paint", "mouse_down/mouse_move/mouse_up", "context_menu", "on_click", "pick_for_tools -> Pick", "is_dragging (drop_target ignora le firme in uscita)", "popup", "label"]
+    - nome: "capture"
+      file: "rust/src/ui/capture.rs"
+      responsabilita: "copia dello schermo virtuale (BitBlt in DIB) prima della finestra di selezione, immagine congelata scurita, rettangolo col trascinamento, Esc/tasto destro annullano (timer GetAsyncKeyState se manca il fuoco); nasconde le finestre indicate durante la copia"
+      funzioni_chiave: ["capture(hide) -> Option<RgbImage>"]
+    - nome: "clipboard"
+      file: "rust/src/ui/clipboard.rs"
+      responsabilita: "firma negli appunti: formato registrato PNG, CF_DIBV5 con alfa, CF_DIB su bianco"
+      funzioni_chiave: ["copy_signature"]
+    - nome: "drag_source"
+      file: "rust/src/ui/drag_source.rs"
+      responsabilita: "trascinamento in uscita di un file salvato: IDataObject della shell (SHCreateItemFromParsingName + BHID_DataObject) e IDropSource proprio"
+      funzioni_chiave: ["drag_file"]
     - nome: "monitors"
       file: "rust/src/ui/monitors.rs"
       responsabilita: "schermi collegati; la barra va sul bordo esterno del desktop o sullo schermo scelto"
@@ -98,6 +122,12 @@ registro_codebase:
     - nome: "save_files / file_stem"
       file: "rust/src/tools/mod.rs"
       usata_in: ["save_pages (Dividi)", "tools/edit.rs save_jpegs"]
+    - nome: "bgra_info"
+      file: "rust/src/ui/paint.rs"
+      usata_in: ["ui/panel.rs draw_thumb", "ui/capture.rs dib"]
+    - nome: "portable_dir / appdata_dir"
+      file: "rust/src/settings.rs"
+      usata_in: ["settings.rs (ini)", "tools/signature.rs (cartella Firme)"]
     - nome: "inherited"
       file: "rust/src/tools/text_layer.rs"
       usata_in: ["rust/src/tools/text_layer.rs", "rust/src/tools/join.rs"]
@@ -126,6 +156,9 @@ registro_codebase:
   gitignore_pattern_aggiunti: []
 
   todo_e_criticita:
+    - "Firme: testo stampato del modulo tolto a mano con la Gomma (automatico scartato); da provare dal vivo"
+    - "Firme 1.2.0: da provare dal vivo (cattura multi-schermo, slider, copia in Word/Outlook, trascinamento, menu destro, Strumenti > Scegli); release.ps1 non ancora eseguito"
+    - "barra a 7 zone (ZONE_SIGNATURES=5, ZONE_JOIN=6): su schermi bassi (1080p al 150%) restano circa 140 px per l'elenco dei file"
     - "zona Strumenti (1.1.0): compilata e testata solo a livello backend; pannello, campi di testo, drop della firma e Salva da provare dal vivo"
     - "Strumenti: un'immagine trascinata diventa PDF tramite compress_image, quindi ridotta al limite di peso"
     - "zona Word, PDF con testo: Word ricostruisce bene ma non identico (a capo e salti pagina possono cambiare); Office aggiunge l'etichetta di riservatezza aziendale al salvataggio"

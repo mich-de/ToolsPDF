@@ -2,7 +2,7 @@
 //! Se la cartella dell'exe non e' scrivibile si usa %APPDATA%\ToolsPDF.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const FILE_NAME: &str = "ToolsPDF.ini";
@@ -28,11 +28,22 @@ pub enum Theme {
     Dark,
 }
 
+/// Dove salvare i file prodotti.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Save {
+    /// Accanto all'originale; da Outlook e dalle cartelle temporanee chiede.
+    Beside,
+    /// Sempre nella cartella scelta (output_folder), anche per gli allegati.
+    Folder,
+    /// Chiede ogni volta.
+    Ask,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     pub limit_mb: u32,
-    /// Chiede dove salvare anche per i file in cartelle normali.
-    pub always_ask: bool,
+    /// Dove finiscono i file prodotti.
+    pub save: Save,
     pub conversion: Conversion,
     /// OCR anche in Comprimi, Dividi e Unisci; la zona Testo lo fa sempre.
     pub always_ocr: bool,
@@ -48,7 +59,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             limit_mb: 1,
-            always_ask: false,
+            save: Save::Beside,
             conversion: Conversion::Ask,
             always_ocr: true,
             side: Side::Right,
@@ -71,8 +82,9 @@ impl Settings {
                         settings.limit_mb = mb;
                     }
                 }
-                ("dove_salvare", "chiedi_sempre") => settings.always_ask = true,
-                ("dove_salvare", "accanto") => settings.always_ask = false,
+                ("dove_salvare", "chiedi_sempre") => settings.save = Save::Ask,
+                ("dove_salvare", "accanto") => settings.save = Save::Beside,
+                ("dove_salvare", "cartella") => settings.save = Save::Folder,
                 ("conversione", "chiedi") => settings.conversion = Conversion::Ask,
                 ("conversione", "sempre") => settings.conversion = Conversion::Always,
                 ("conversione", "mai") => settings.conversion = Conversion::Never,
@@ -105,7 +117,11 @@ impl Settings {
             Theme::Light => "chiaro",
             Theme::Dark => "scuro",
         };
-        let save = if self.always_ask { "chiedi_sempre" } else { "accanto" };
+        let save = match self.save {
+            Save::Beside => "accanto",
+            Save::Folder => "cartella",
+            Save::Ask => "chiedi_sempre",
+        };
         let monitor = self.monitor.map_or_else(|| "auto".to_string(), |n| n.to_string());
         let ocr = if self.always_ocr { "sempre" } else { "solo_testo" };
         let updates = if self.check_updates { "chiedi" } else { "mai" };
@@ -175,6 +191,34 @@ impl ToolsPrefs {
 }
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
+/// Cartella fissa per i file prodotti (Save::Folder). Fuori da Settings, che resta Copy.
+static OUTPUT: Mutex<Option<PathBuf>> = Mutex::new(None);
+const OUTPUT_KEY: &str = "cartella_output";
+
+/// Cartella fissa scelta, anche se oggi la scelta attiva non e' Save::Folder.
+pub fn output_folder() -> Option<PathBuf> {
+    OUTPUT.lock().ok().and_then(|o| o.clone())
+}
+
+fn set_output_folder(folder: Option<PathBuf>) {
+    if let Ok(mut current) = OUTPUT.lock() {
+        *current = folder;
+    }
+}
+
+fn parse_output(text: &str) -> Option<PathBuf> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, _)| key.trim() == OUTPUT_KEY)
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn output_text() -> String {
+    let folder = output_folder().map_or_else(String::new, |p| p.display().to_string());
+    format!("{OUTPUT_KEY}={folder}\r\n")
+}
 static TOOLS: Mutex<Option<ToolsPrefs>> = Mutex::new(None);
 
 pub fn tools_prefs() -> ToolsPrefs {
@@ -197,12 +241,35 @@ fn set_current(settings: Settings) {
     }
 }
 
+/// Cartella dell'exe: l'app e' portable e ci tiene impostazioni e firme.
+pub fn portable_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(PathBuf::from)
+}
+
+/// Vero se l'exe (e quindi firme e impostazioni accanto) sta in una cartella OneDrive.
+pub fn on_onedrive() -> bool {
+    let roots: Vec<PathBuf> = ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"].iter().filter_map(|name| std::env::var_os(name)).map(PathBuf::from).collect();
+    portable_dir().is_some_and(|dir| inside(&dir, &roots))
+}
+
+/// dir dentro una delle cartelle indicate, senza badare a maiuscole e barre finali.
+fn inside(dir: &Path, roots: &[PathBuf]) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+    let dir = norm(dir);
+    roots.iter().map(|r| norm(r)).any(|root| !root.is_empty() && (dir == root || dir.starts_with(&format!("{root}\\"))))
+}
+
+/// %APPDATA%\ToolsPDF, se la cartella dell'exe non e' scrivibile.
+pub fn appdata_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("ToolsPDF"))
+}
+
 fn portable_path() -> Option<PathBuf> {
-    std::env::current_exe().ok()?.parent().map(|dir| dir.join(FILE_NAME))
+    portable_dir().map(|dir| dir.join(FILE_NAME))
 }
 
 fn appdata_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("ToolsPDF").join(FILE_NAME))
+    appdata_dir().map(|dir| dir.join(FILE_NAME))
 }
 
 /// File in uso: quello accanto all'exe se c'e', altrimenti quello in AppData.
@@ -219,12 +286,14 @@ pub fn load() -> Settings {
     let settings = Settings::parse(&text);
     set_current(settings);
     set_tools_prefs(ToolsPrefs::parse(&text));
+    set_output_folder(parse_output(&text));
     settings
 }
 
-/// Salva e rende attive le impostazioni. Restituisce il file scritto.
-pub fn save(settings: Settings) -> Result<PathBuf, String> {
+/// Salva e rende attive le impostazioni e la cartella fissa. Restituisce il file scritto.
+pub fn save(settings: Settings, folder: Option<PathBuf>) -> Result<PathBuf, String> {
     set_current(settings);
+    set_output_folder(folder);
     write_file(&full_text())
 }
 
@@ -236,7 +305,7 @@ pub fn save_tools(prefs: ToolsPrefs) -> Result<PathBuf, String> {
 
 /// Il file si riscrive sempre intero: impostazioni generali e zona Strumenti.
 fn full_text() -> String {
-    current().to_text() + &tools_prefs().to_text()
+    current().to_text() + &output_text() + &tools_prefs().to_text()
 }
 
 fn write_file(text: &str) -> Result<PathBuf, String> {
@@ -259,7 +328,7 @@ mod tests {
 
     #[test]
     fn round_trip_keeps_every_choice() {
-        let settings = Settings { limit_mb: 5, always_ask: true, conversion: Conversion::Never, always_ocr: false, side: Side::Left, theme: Theme::Dark, monitor: Some(2), check_updates: false };
+        let settings = Settings { limit_mb: 5, save: Save::Folder, conversion: Conversion::Never, always_ocr: false, side: Side::Left, theme: Theme::Dark, monitor: Some(2), check_updates: false };
         assert_eq!(Settings::parse(&settings.to_text()), settings);
     }
 
@@ -282,5 +351,24 @@ mod tests {
     fn ocr_is_on_unless_disabled() {
         assert!(Settings::parse("").always_ocr);
         assert!(!Settings::parse("ocr=solo_testo").always_ocr);
+    }
+
+    #[test]
+    fn output_folder_shares_the_file_and_empty_means_none() {
+        let text = format!("{}cartella_output=D:\\PDF fatti\r\n", Settings::default().to_text());
+        assert_eq!(parse_output(&text), Some(PathBuf::from(r"D:\PDF fatti")));
+        assert_eq!(Settings::parse(&text), Settings::default());
+        assert_eq!(parse_output("cartella_output=\r\n"), None);
+        assert_eq!(Settings::parse("dove_salvare=cartella").save, Save::Folder);
+    }
+
+    #[test]
+    fn onedrive_folder_is_recognized() {
+        let roots = [PathBuf::from(r"C:\Users\a\OneDrive - Ditta SA\")];
+        assert!(inside(Path::new(r"c:\users\a\onedrive - ditta sa\ToolsPDF"), &roots));
+        assert!(inside(Path::new(r"C:\Users\a\OneDrive - Ditta SA"), &roots));
+        assert!(!inside(Path::new(r"C:\Users\a\OneDrive - Ditta SA2\x"), &roots));
+        assert!(!inside(Path::new(r"C:\Tools"), &roots));
+        assert!(!inside(Path::new(r"C:\Tools"), &[PathBuf::new()]));
     }
 }

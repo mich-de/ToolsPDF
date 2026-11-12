@@ -41,6 +41,10 @@ fn sys_hwnd(hwnd: HWND) -> windows_sys::Win32::Foundation::HWND {
 
 impl DropTarget {
     fn zone_at(&self, pt: &POINTL) -> Option<usize> {
+        // Una firma trascinata fuori dal pannello non deve finire nelle zone della barra.
+        if super::signatures_panel::is_dragging() {
+            return None;
+        }
         match self.target {
             Target::Bar => super::zone_at_screen(sys_hwnd(self.hwnd), pt.x, pt.y),
             Target::Panel => super::panel::drop_zone_at(pt.x, pt.y),

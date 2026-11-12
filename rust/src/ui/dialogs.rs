@@ -39,7 +39,7 @@ pub fn pick_file(owner: windows_sys::Win32::Foundation::HWND, suggested: &str) -
 /// Chiede la cartella in cui creare la cartella folder_name (es. nome_pagine). None se l'utente annulla.
 pub fn pick_folder(owner: windows_sys::Win32::Foundation::HWND, folder_name: &str) -> Option<PathBuf> {
     loop {
-        let path = show_folder(owner, folder_name).ok()??;
+        let path = show_folder(owner, &format!("Dove creare la cartella {folder_name}?")).ok()??;
         if accept_folder(owner, &path) {
             return Some(path);
         }
@@ -87,12 +87,22 @@ fn show_save(owner: windows_sys::Win32::Foundation::HWND, suggested: &str) -> wi
     }
 }
 
-fn show_folder(owner: windows_sys::Win32::Foundation::HWND, folder_name: &str) -> windows::core::Result<Option<PathBuf>> {
+/// Chiede la cartella fissa dove salvare i file prodotti. None se l'utente annulla.
+pub fn pick_output_folder(owner: windows_sys::Win32::Foundation::HWND) -> Option<PathBuf> {
+    loop {
+        let path = show_folder(owner, "Cartella dove salvare i file prodotti").ok()??;
+        if accept_folder(owner, &path) {
+            return Some(path);
+        }
+    }
+}
+
+fn show_folder(owner: windows_sys::Win32::Foundation::HWND, title: &str) -> windows::core::Result<Option<PathBuf>> {
     unsafe {
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
         let options = dialog.GetOptions()?;
         dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
-        dialog.SetTitle(&HSTRING::from(format!("Dove creare la cartella {folder_name}?")))?;
+        dialog.SetTitle(&HSTRING::from(title))?;
         run_dialog(&dialog.cast()?, owner)
     }
 }

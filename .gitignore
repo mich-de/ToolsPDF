@@ -8,4 +8,6 @@ rust/target/
 
 # Preferenze personali e note di lavoro locali
 ToolsPDF.ini
+# Firme salvate accanto all'exe: dati personali, mai nel repository
+Firme/
 HANDOFF.md
