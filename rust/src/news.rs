@@ -3,7 +3,7 @@
 
 /// Versione e novita', la piu' recente per prima.
 const NEWS: &[(&str, &str)] = &[(
-    "1.3.0",
+    "1.4.0",
     "• Spazio sullo schermo: ora la barra si apre \"Sopra le finestre\" senza spostare le icone del desktop (modificabile in Impostazioni).\n\
      • Scanner di sistema: se sul PC è collegato uno scanner WIA, compare l'icona in alto per scansionare (vetro o alimentatore ADF multipagina) direttamente in Testo (OCR) o Comprimi.\n\
      • Aggiornamenti: banner nella barra quando è disponibile una nuova versione e tasto \"Cerca aggiornamenti\" in Info.\n\
@@ -32,11 +32,11 @@ mod tests {
 
     #[test]
     fn news_appear_once_after_an_update_but_not_on_first_use() {
-        assert!(should_show(true, false, None, "1.3.0"));
-        assert!(should_show(false, true, Some("1.1.1"), "1.3.0"));
-        assert!(should_show(false, true, None, "1.3.0"));
-        assert!(!should_show(false, false, None, "1.3.0"), "primo uso");
-        assert!(!should_show(true, true, Some("1.3.0"), "1.3.0"), "gia' viste");
+        assert!(should_show(true, false, None, "1.4.0"));
+        assert!(should_show(false, true, Some("1.1.1"), "1.4.0"));
+        assert!(should_show(false, true, None, "1.4.0"));
+        assert!(!should_show(false, false, None, "1.4.0"), "primo uso");
+        assert!(!should_show(true, true, Some("1.4.0"), "1.4.0"), "gia' viste");
         assert!(!should_show(true, true, None, "9.9.9"), "versione senza novita'");
         assert!(of(env!("CARGO_PKG_VERSION")).is_some(), "manca il testo delle novita' di questa versione");
     }
