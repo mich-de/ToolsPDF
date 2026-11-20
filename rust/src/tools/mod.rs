@@ -12,7 +12,9 @@ mod ocr;
 mod office;
 pub mod preview;
 mod pdf_write;
+pub mod portrait;
 mod raster;
+pub mod scanner;
 pub mod signature;
 mod split;
 mod text_layer;
@@ -150,7 +152,7 @@ impl Destination {
     fn work_dir(&self) -> PathBuf {
         match self {
             Destination::NextTo(path) | Destination::File(path) => {
-                path.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+                path.parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf)
             }
             Destination::Folder(folder) => folder.clone(),
         }
@@ -303,7 +305,9 @@ fn run_split(file: &Loaded, dest: &Destination, cb: Callbacks, with_ocr: bool) -
         summary.push_str(" · ");
         summary.push_str(&ocr_note);
     }
-    if converted > 0 {
+    if converted == 1 {
+        summary.push_str(" · 1 convertita con OCR");
+    } else if converted > 1 {
         summary.push_str(&format!(" · {converted} convertite con OCR"));
     }
     Ok(Outcome { output: folder, is_folder: true, summary })

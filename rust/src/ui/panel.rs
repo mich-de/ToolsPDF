@@ -13,13 +13,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::drop_target::{self, Target};
 use super::paint::{bgra_info, client_rect, draw_text, fill_rect, fill_round_rect, line, outline, paint_button, text_height, with_pen, MARGIN};
+use super::photo_panel::{self, PhotoHit, DROP_PHOTO};
+use super::scanner_panel::{self, ScanHit};
 use super::signatures_panel::{self, SigHit, DROP_IMAGE};
 use super::tools_panel::{self, ToolsHit, DROP_FILE, DROP_SIGNATURE};
 use super::win::{rect, wide, Cell2, RectExt};
 use super::{high_word, low_word, main_hwnd, monitors, scale, with_tray, Ui, APP_TITLE, AUTHOR, BUILD_DATE, UI, VERSION, ZONE_JOIN, ZONE_TOOLS};
 use std::path::PathBuf;
 
-use crate::settings::{self, Conversion, Save, Settings, Side, Theme, LIMITS_MB};
+use crate::settings::{self, Conversion, Save, Settings, Side, Theme, ZoneFolders, LIMITS_MB, ZONE_FOLDERS};
 use crate::tools::preview::Thumb;
 use crate::tools::Source;
 
@@ -38,6 +40,9 @@ const PAGES_LABEL: i32 = 30;
 const GROUP_STEP: i32 = 66;
 /// Riga della cartella fissa sotto "Dove salvare": sposta in giu' i gruppi successivi.
 const FOLDER_ROW: i32 = 34;
+/// Blocco "Cartella per zona" sotto la cartella fissa: titolo e una riga per zona.
+const ZONES_TITLE: i32 = 26;
+const ZONE_ROW: i32 = 30;
 const SAVE_GROUP: usize = 1;
 const DRAG_THRESHOLD: i32 = 5;
 
@@ -47,6 +52,10 @@ pub(crate) enum Mode {
     Join,
     Tools,
     Signatures,
+    /// Editor della foto tessera.
+    Photo,
+    /// Acquisizione dallo scanner WIA di sistema.
+    Scanner,
     Info,
     Settings,
 }
@@ -55,6 +64,8 @@ pub(crate) enum Mode {
 enum Hit {
     Tools(ToolsHit),
     Signatures(SigHit),
+    Photo(PhotoHit),
+    Scan(ScanHit),
     Nothing,
     Close,
     Row(usize),
@@ -66,6 +77,9 @@ enum Hit {
     Choice(usize, usize),
     /// Tasto Cambia… della cartella fissa.
     Folder,
+    /// Scegli/Cambia… e ✕ della cartella di una zona.
+    ZoneFolder(usize),
+    ZoneClear(usize),
     Save,
     /// Indirizzo del progetto nel pannello Info.
     Link,
@@ -99,6 +113,12 @@ struct Panel {
     draft: Cell2<Settings>,
     /// Cartella fissa in modifica, salvata con Salva.
     draft_folder: RefCell<Option<PathBuf>>,
+    /// Cartelle delle zone in modifica, salvate con Salva.
+    draft_zones: RefCell<ZoneFolders>,
+    /// Scorrimento delle Impostazioni, piu' alte dello schermo sui monitor bassi.
+    settings_scroll: Cell2<i32>,
+    /// Falso quando un'app a schermo intero deve coprire anche il pannello.
+    topmost: Cell2<bool>,
     note: RefCell<String>,
 }
 
@@ -116,6 +136,9 @@ thread_local! {
         drop_zone: Cell2::new(None),
         draft: Cell2::new(Settings::default()),
         draft_folder: RefCell::new(None),
+        draft_zones: RefCell::new(Default::default()),
+        settings_scroll: Cell2::new(0),
+        topmost: Cell2::new(true),
         note: RefCell::new(String::new()),
     };
 }
@@ -260,6 +283,7 @@ pub(crate) fn drop_zone_at(x: i32, y: i32) -> Option<usize> {
         Mode::Tools => Some(UI.with(|ui| tools_panel::drop_zone(hwnd, ui, point.x, point.y))),
         Mode::Join => Some(DROP_JOIN),
         Mode::Signatures => Some(DROP_IMAGE),
+        Mode::Photo => Some(DROP_PHOTO),
         _ => None,
     }
 }
@@ -279,7 +303,11 @@ pub(crate) fn on_drop(zone: usize, mut sources: Vec<Source>, errors: Vec<(String
         }
         DROP_IMAGE if !sources.is_empty() => {
             signatures_panel::load_dropped(sources.remove(0));
-            invalidate();
+            show(Mode::Signatures);
+        }
+        DROP_PHOTO if !sources.is_empty() => {
+            photo_panel::load_dropped(sources.remove(0));
+            show(Mode::Photo);
         }
         DROP_JOIN => super::on_drop(ZONE_JOIN, sources, errors),
         DROP_FILE => super::on_drop(ZONE_TOOLS, sources, errors),
@@ -294,6 +322,8 @@ fn show(mode: Mode) {
         if mode == Mode::Settings {
             p.draft.set(settings::current());
             *p.draft_folder.borrow_mut() = settings::output_folder();
+            *p.draft_zones.borrow_mut() = settings::zone_folders();
+            p.settings_scroll.set(0);
             p.note.borrow_mut().clear();
         }
     });
@@ -351,6 +381,11 @@ pub(crate) fn show_signatures() {
     show(Mode::Signatures);
 }
 
+/// Mostra l'editor della foto tessera, vuoto o con la foto appena arrivata.
+pub(crate) fn show_photo() {
+    show(Mode::Photo);
+}
+
 /// Il pannello sta sul lato libero della barra, alto quanto lei.
 pub(crate) fn reposition() {
     let hwnd = PANEL.with(|p| p.hwnd.get());
@@ -364,9 +399,21 @@ pub(crate) fn reposition() {
     let x = if settings::current().side == Side::Left { bar_rect.right } else { bar_rect.left - width };
     let screen = monitors::containing(&bar_rect);
     let x = screen.map_or(x, |m| x.clamp(m.rect.left, (m.rect.right - width).max(m.rect.left)));
+    let topmost = PANEL.with(|p| p.topmost.get());
     unsafe {
-        SetWindowPos(hwnd, HWND_TOPMOST, x, bar_rect.top, width, bar_rect.bottom - bar_rect.top, SWP_NOACTIVATE);
+        SetWindowPos(hwnd, if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST }, x, bar_rect.top, width, bar_rect.bottom - bar_rect.top, SWP_NOACTIVATE);
     }
+}
+
+/// Un'app a schermo intero deve poter coprire il pannello, poi torna sopra le altre finestre.
+pub(crate) fn set_topmost(top: bool) {
+    PANEL.with(|p| p.topmost.set(top));
+    let hwnd = PANEL.with(|p| p.hwnd.get());
+    if hwnd.is_null() {
+        return;
+    }
+    let order = if top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    unsafe { SetWindowPos(hwnd, order, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
 }
 
 // ---------- geometria ----------
@@ -420,7 +467,33 @@ fn close_rect(hwnd: HWND, ui: &Ui) -> RECT {
 /// Cima del gruppo di impostazioni: dopo "Dove salvare" c'e' la riga della cartella fissa.
 fn group_top(ui: &Ui, group: usize) -> i32 {
     let s = |v| scale(ui, v);
-    s(HEADER) + s(12) + group as i32 * s(GROUP_STEP) + if group > SAVE_GROUP { s(FOLDER_ROW) } else { 0 }
+    let below_save = s(FOLDER_ROW) + zones_height(ui);
+    s(HEADER) + s(12) + group as i32 * s(GROUP_STEP) + if group > SAVE_GROUP { below_save } else { 0 } - PANEL.with(|p| p.settings_scroll.get())
+}
+
+fn zones_height(ui: &Ui) -> i32 {
+    scale(ui, ZONES_TITLE) + ZONE_FOLDERS.len() as i32 * scale(ui, ZONE_ROW) + scale(ui, 8)
+}
+
+/// Titolo del blocco "Cartella per zona".
+fn zones_title(hwnd: HWND, ui: &Ui) -> RECT {
+    let s = |v| scale(ui, v);
+    let client = client_rect(hwnd);
+    let top = folder_rects(hwnd, ui).1.bottom + s(10);
+    rect(s(MARGIN), top, client.right - s(MARGIN), top + s(ZONES_TITLE))
+}
+
+/// Riga della zona k: nome, percorso, Scegli/Cambia…, ✕.
+fn zone_rects(hwnd: HWND, ui: &Ui, k: usize) -> (RECT, RECT, RECT, RECT) {
+    let s = |v| scale(ui, v);
+    let client = client_rect(hwnd);
+    let top = zones_title(hwnd, ui).bottom + k as i32 * s(ZONE_ROW);
+    let bottom = top + s(SMALL_BUTTON);
+    let right = client.right - s(MARGIN);
+    let clear = rect(right - s(SMALL_BUTTON), top, right, bottom);
+    let change = rect(clear.left - s(4) - s(76), top, clear.left - s(4), bottom);
+    let label = rect(s(MARGIN), top, s(MARGIN) + s(84), bottom);
+    (label, rect(label.right, top, change.left - s(6), bottom), change, clear)
 }
 
 /// Riga della cartella fissa: percorso e tasto Cambia….
@@ -457,6 +530,8 @@ fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Hit {
     match mode() {
         Mode::Tools => Hit::Tools(tools_panel::hit_test(hwnd, ui, x, y)),
         Mode::Signatures => Hit::Signatures(signatures_panel::hit_test(hwnd, ui, x, y)),
+        Mode::Photo => Hit::Photo(photo_panel::hit_test(hwnd, ui, x, y)),
+        Mode::Scanner => Hit::Scan(scanner_panel::hit_test(hwnd, ui, x, y)),
         Mode::Join => {
             let count = with_tray(|tray| tray.len()).unwrap_or(0);
             let (join, clear) = footer_buttons(hwnd, ui);
@@ -498,6 +573,16 @@ fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Hit {
             if folder_rects(hwnd, ui).1.contains(x, y) {
                 return Hit::Folder;
             }
+            let zones = PANEL.with(|p| p.draft_zones.borrow().clone());
+            for k in 0..ZONE_FOLDERS.len() {
+                let (_, _, change, clear) = zone_rects(hwnd, ui, k);
+                if change.contains(x, y) {
+                    return Hit::ZoneFolder(k);
+                }
+                if clear.contains(x, y) && zones[k].is_some() {
+                    return Hit::ZoneClear(k);
+                }
+            }
             if save_rect(hwnd, ui).contains(x, y) {
                 return Hit::Save;
             }
@@ -534,6 +619,8 @@ fn paint(hwnd: HWND, ui: &Ui) {
             },
             Mode::Tools => "Strumenti".into(),
             Mode::Signatures => "Firme".into(),
+            Mode::Photo => "Foto tessera".into(),
+            Mode::Scanner => "Scanner".into(),
             Mode::Info => "Informazioni".into(),
             Mode::Settings => "Impostazioni".into(),
             Mode::Hidden => String::new(),
@@ -560,6 +647,16 @@ fn paint(hwnd: HWND, ui: &Ui) {
                 let (hover, drop) = PANEL.with(|p| (p.hover.get(), p.drop_zone.get()));
                 let hover = if let Hit::Signatures(hit) = hover { hit } else { SigHit::Nothing };
                 signatures_panel::paint(dc, hwnd, ui, client, hover, drop == Some(DROP_IMAGE));
+            }
+            Mode::Photo => {
+                let (hover, drop) = PANEL.with(|p| (p.hover.get(), p.drop_zone.get()));
+                let hover = if let Hit::Photo(hit) = hover { hit } else { PhotoHit::Nothing };
+                photo_panel::paint(dc, hwnd, ui, client, hover, drop == Some(DROP_PHOTO));
+            }
+            Mode::Scanner => {
+                let hover = PANEL.with(|p| p.hover.get());
+                let hover = if let Hit::Scan(hit) = hover { hit } else { ScanHit::Nothing };
+                scanner_panel::paint(dc, hwnd, ui, client, hover);
             }
             Mode::Join => paint_join(dc, hwnd, ui, client),
             Mode::Info => paint_info(dc, hwnd, ui, client),
@@ -791,7 +888,7 @@ fn paint_info(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
     draw_text(dc, &web_address(), link, fonts.small, colors.primary, line_flags);
     y = link.bottom + s(12);
 
-    let paragraphs: [(&str, String); 10] = [
+    let paragraphs: [(&str, String); 11] = [
         ("Comprimi", format!("Porta PDF, immagini, Word ed Excel sotto {}.", crate::tools::limit_label())),
         ("Dividi", "Crea la cartella nome_pagine con un PDF per pagina, ognuno nel limite.".into()),
         (
@@ -810,6 +907,10 @@ fn paint_info(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
             "Firme",
             "Cattura una firma dallo schermo o da una foto: diventa nera su sfondo trasparente. Clic per copiarla, trascinala nel documento o usala in Strumenti.".into(),
         ),
+        (
+            "Foto tessera",
+            "Trascina una foto sulla zona Foto tessera: sfondo bianco o trasparente, formato a scelta (35x45 UE, 2x2\" USA e altri) con le guide per il volto, messa a fuoco, salvata a 600 DPI.".into(),
+        ),
         ("Unisci", "Raccogli i file anche da email diverse, ordinali qui e premi Unisci.".into()),
         (
             "Dove salva",
@@ -824,7 +925,7 @@ fn paint_info(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
         ),
         (
             "Crediti",
-            "Scritte dei moduli lette con ocrs (MIT/Apache-2.0). Modelli: Ocrs models (github.com/robertknight/ocrs-models), addestrati sul dataset HierText di Google Research, licenza CC BY-SA 4.0.".into(),
+            "Scritte dei moduli lette con ocrs (MIT/Apache-2.0). Modelli: Ocrs models (github.com/robertknight/ocrs-models), addestrati sul dataset HierText di Google Research, licenza CC BY-SA 4.0. Sfondo delle foto staccato con U-2-Net (modello u2netp, Xuebin Qin e altri, github.com/xuebinqin/U-2-Net, Apache-2.0).".into(),
         ),
     ];
     for (heading, body) in paragraphs {
@@ -842,6 +943,8 @@ fn paint_settings(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
     let fonts = ui.fonts.get();
     let draft = PANEL.with(|p| p.draft.get());
     let hover = PANEL.with(|p| p.hover.get());
+    let saved_dc = unsafe { SaveDC(dc) };
+    unsafe { IntersectClipRect(dc, 0, s(HEADER), client.right, client.bottom) };
     for (group, (label, choices)) in groups().iter().enumerate() {
         let top = group_top(ui, group);
         draw_text(dc, label, rect(s(MARGIN), top, client.right - s(MARGIN), top + s(22)), fonts.body_bold, colors.fg, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
@@ -865,11 +968,29 @@ fn paint_settings(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
     draw_text(dc, &path_text, path_box, fonts.small, path_color, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
     paint_button(dc, ui, change, "Cambia…", true, false, hover == Hit::Folder);
 
+    let zones = PANEL.with(|p| p.draft_zones.borrow().clone());
+    draw_text(dc, "Cartella per zona (vuota = come sopra)", zones_title(hwnd, ui), fonts.body_bold, colors.fg, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    for (k, (name, _)) in ZONE_FOLDERS.iter().enumerate() {
+        let (label, path_box, change, clear) = zone_rects(hwnd, ui, k);
+        draw_text(dc, name, label, fonts.small, colors.fg, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        match &zones[k] {
+            Some(path) => {
+                draw_text(dc, &path.display().to_string(), path_box, fonts.small, colors.fg, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
+                paint_button(dc, ui, change, "Cambia…", true, false, hover == Hit::ZoneFolder(k));
+                paint_remove(dc, ui, clear, hover == Hit::ZoneClear(k));
+            }
+            None => {
+                draw_text(dc, "come sopra", path_box, fonts.small, colors.muted, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                paint_button(dc, ui, change, "Scegli…", true, false, hover == Hit::ZoneFolder(k));
+            }
+        }
+    }
+
     let save = save_rect(hwnd, ui);
-    let changed = draft != settings::current() || folder != settings::output_folder();
+    let changed = draft != settings::current() || folder != settings::output_folder() || zones != settings::zone_folders();
     paint_button(dc, ui, save, "Salva", changed, true, hover == Hit::Save);
     let note = PANEL.with(|p| p.note.borrow().clone());
-    let hint = "Cartella fissa: tutti i file prodotti, anche dagli allegati di Outlook, finiscono lì senza domande. Altrimenti da Outlook e dalle cartelle temporanee chiede sempre dove salvare. Schermo automatico: il bordo esterno del desktop sul lato scelto.";
+    let hint = "Cartella per zona: i file di quella zona finiscono lì, qualunque sia la scelta sopra. Cartella fissa: tutti i file prodotti, anche dagli allegati di Outlook, finiscono lì senza domande. Altrimenti da Outlook e dalle cartelle temporanee chiede sempre dove salvare. Schermo automatico: il bordo esterno del desktop sul lato scelto.";
     // Firme e impostazioni stanno accanto all'exe: su OneDrive seguono l'utente su un altro PC.
     let (cloud, cloud_color) = if settings::on_onedrive() {
         ("✓ Firme e impostazioni sono su OneDrive: ti seguono se cambi computer.", colors.ok)
@@ -884,6 +1005,14 @@ fn paint_settings(dc: HDC, hwnd: HWND, ui: &Ui, client: RECT) {
         let height = text_height(dc, text, client.right - 2 * s(MARGIN), fonts.small);
         draw_text(dc, text, rect(s(MARGIN), y, client.right - s(MARGIN), y + height), fonts.small, color, DT_WORDBREAK | DT_NOPREFIX);
         y += height + s(8);
+    }
+    unsafe { RestoreDC(dc, saved_dc) };
+    // Fondo del contenuto: limita lo scorrimento con la rotella.
+    let scroll = PANEL.with(|p| p.settings_scroll.get());
+    let max_scroll = (y + scroll - client.bottom).max(0);
+    if scroll > max_scroll {
+        PANEL.with(|p| p.settings_scroll.set(max_scroll));
+        unsafe { InvalidateRect(hwnd, null(), 0) };
     }
 }
 
@@ -901,6 +1030,14 @@ fn on_click(hwnd: HWND, hit: Hit) {
             signatures_panel::on_click(hwnd, hit);
             PANEL.with(|p| p.hover.set(Hit::Nothing));
             sync_children(hwnd);
+        }
+        Hit::Photo(hit) => {
+            UI.with(|ui| photo_panel::on_click(hwnd, ui, hit));
+            PANEL.with(|p| p.hover.set(Hit::Nothing));
+        }
+        Hit::Scan(hit) => {
+            UI.with(|ui| scanner_panel::on_click(hwnd, ui, hit));
+            PANEL.with(|p| p.hover.set(Hit::Nothing));
         }
         Hit::Close => hide(),
         Hit::Up(index) => super::tray_move(index, index - 1),
@@ -925,6 +1062,18 @@ fn on_click(hwnd: HWND, hit: Hit) {
                 PANEL.with(|p| p.draft.set(with_choice(p.draft.get(), SAVE_GROUP, 1)));
             }
         }
+        Hit::ZoneFolder(k) => {
+            if let Some(folder) = super::dialogs::pick_output_folder(hwnd) {
+                PANEL.with(|p| {
+                    p.draft_zones.borrow_mut()[k] = Some(folder);
+                    p.note.borrow_mut().clear();
+                });
+            }
+        }
+        Hit::ZoneClear(k) => PANEL.with(|p| {
+            p.draft_zones.borrow_mut()[k] = None;
+            p.note.borrow_mut().clear();
+        }),
         Hit::Save => save_settings(),
         Hit::Link => super::open_web(&web_address()),
         Hit::Row(_) | Hit::Nothing => {}
@@ -945,11 +1094,12 @@ fn pick_output(hwnd: HWND) -> bool {
 fn save_settings() {
     let draft = PANEL.with(|p| p.draft.get());
     let folder = PANEL.with(|p| p.draft_folder.borrow().clone());
+    let zones = PANEL.with(|p| p.draft_zones.borrow().clone());
     let previous = settings::current();
-    if draft == previous && folder == settings::output_folder() {
+    if draft == previous && folder == settings::output_folder() && zones == settings::zone_folders() {
         return;
     }
-    let note = match settings::save(draft, folder) {
+    let note = match settings::save(draft, folder, zones) {
         Ok(path) => format!("Impostazioni salvate in {}.", path.display()),
         Err(error) => format!("Attive fino alla chiusura, ma non salvate: {error}"),
     };
@@ -990,6 +1140,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
             WM_SIZE => {
                 sync_children(hwnd);
             }
+            WM_CAPTURECHANGED => {
+                if mode() == Mode::Signatures {
+                    signatures_panel::cancel_capture();
+                }
+                if mode() == Mode::Photo {
+                    photo_panel::cancel_capture();
+                }
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
             WM_MOUSEMOVE => {
                 let (x, y) = (low_word(lparam), high_word(lparam));
                 if !PANEL.with(|p| p.tracking.replace(true)) {
@@ -998,6 +1158,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                 }
                 UI.with(|ui| {
                     if mode() == Mode::Signatures && signatures_panel::mouse_move(hwnd, ui, x, y) {
+                        return;
+                    }
+                    if mode() == Mode::Photo && photo_panel::mouse_move(hwnd, ui, x, y) {
                         return;
                     }
                     if let Some((_, start_y)) = PANEL.with(|p| p.press.get()) {
@@ -1029,6 +1192,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                     InvalidateRect(hwnd, null(), 0);
                     return 0;
                 }
+                if mode() == Mode::Photo && UI.with(|ui| photo_panel::mouse_down(hwnd, ui, low_word(lparam), high_word(lparam))) {
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
                 let hit = UI.with(|ui| hit_test(hwnd, ui, low_word(lparam), high_word(lparam)));
                 if let Hit::Row(index) = hit {
                     PANEL.with(|p| p.press.set(Some((index, high_word(lparam)))));
@@ -1038,6 +1205,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
             }
             WM_LBUTTONUP => {
                 if mode() == Mode::Signatures && UI.with(|ui| signatures_panel::mouse_up(hwnd, ui)) {
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
+                if mode() == Mode::Photo && UI.with(|ui| photo_panel::mouse_up(hwnd, ui)) {
                     InvalidateRect(hwnd, null(), 0);
                     return 0;
                 }
@@ -1077,10 +1248,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                     PANEL.with(|p| {
                         if p.mode.get() == Mode::Tools {
                             tools_panel::scroll(step);
+                        } else if p.mode.get() == Mode::Photo {
+                            photo_panel::zoom(hwnd, ui, delta, point);
                         } else if p.mode.get() == Mode::Signatures {
                             if !signatures_panel::zoom(hwnd, ui, delta, point) {
                                 signatures_panel::scroll(step);
                             }
+                        } else if p.mode.get() == Mode::Settings {
+                            p.settings_scroll.set((p.settings_scroll.get() - step).max(0));
                         } else if list_rect(hwnd, ui, count).contains(point.x, point.y) {
                             p.list_scroll.set(p.list_scroll.get() - step);
                         } else {

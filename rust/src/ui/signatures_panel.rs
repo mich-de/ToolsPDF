@@ -15,7 +15,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use super::paint::{bgra_info, client_rect, draw_text, fill_rect, fill_round_rect, outline, paint_button, text_height, with_pen, MARGIN};
+use super::paint::{bgra_info, client_rect, draw_text, eraser_radius, fill_rect, fill_round_rect, outline, paint_brush, paint_button, paint_eraser_size, set_eraser_size_at, slider_track, text_height, with_pen, MARGIN};
 use super::panel::{paint_remove, HEADER};
 use super::tools_panel::{get_text, paint_check, paint_field, set_text};
 use super::win::{self, rect, wide, Cell2, RectExt};
@@ -39,12 +39,10 @@ const CHECK: i32 = 26;
 const FIELD: i32 = 26;
 const CHECKER: i32 = 6;
 const DRAG_THRESHOLD: i32 = 5;
-/// Raggio della gomma sullo schermo.
-const ERASER: i32 = 9;
 /// Livelli di zoom della rotella con la gomma attiva.
 const ZOOMS: [f32; 6] = [1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 /// Spiegazione sotto l'anteprima grande, con la gomma attiva.
-const ERASE_HINT: &str = "Gomma magica: passa sulle scritte stampate; toglie solo i pezzi che stanno tutti dentro la passata, i tratti della firma restano interi. Gomma: cancella tutto quello che tocca, per le lettere attaccate alla firma. Rotella: zoom.";
+const ERASE_HINT: &str = "Gomma magica: passa sulle scritte stampate; toglie solo i pezzi che stanno tutti dentro la passata, i tratti della firma restano interi. Gomma: cancella tutto quello che tocca, per le lettere attaccate alla firma. Rotella: zoom. Misura: grandezza della gomma.";
 const EM_LIMITTEXT: u32 = 0x00C5;
 const HINT: &str = "Clic: copia negli appunti · trascinala nel documento · tasto destro: altro";
 const EMPTY: &str = "Nessuna firma salvata.\n\nPremi Cattura firma e trascina un riquadro sulla firma, oppure trascina qui una foto o una scansione della firma.";
@@ -69,6 +67,8 @@ pub(crate) enum SigHit {
     Magic,
     Eraser,
     Undo,
+    /// Misura della gomma (con la gomma attiva).
+    Size,
     Preview,
     Done,
     Save,
@@ -188,6 +188,8 @@ struct SigUi {
     /// Firma premuta e punto del clic: diventa trascinamento oltre una soglia.
     press: Cell2<Option<(usize, POINT)>>,
     sliding: Cell2<bool>,
+    /// Trascinamento dello slider della misura della gomma.
+    sizing: Cell2<bool>,
     dragging: Cell2<bool>,
     /// Ultima posizione del mouse sull'anteprima: cerchio della gomma.
     pointer: Cell2<POINT>,
@@ -206,6 +208,7 @@ thread_local! {
         note: RefCell::new((String::new(), false)),
         press: Cell2::new(None),
         sliding: Cell2::new(false),
+        sizing: Cell2::new(false),
         dragging: Cell2::new(false),
         pointer: Cell2::new(POINT { x: 0, y: 0 }),
         edit: Cell2::new(null_mut()),
@@ -342,6 +345,8 @@ struct Layout {
     magic: RECT,
     eraser: RECT,
     undo: RECT,
+    /// Misura della gomma: solo con la gomma attiva (vuoto altrimenti).
+    size: RECT,
     done: RECT,
     erase_note: RECT,
     ends: RECT,
@@ -376,11 +381,12 @@ fn layout(hwnd: HWND, ui: &Ui) -> Layout {
     let erasing = SIGS.with(|g| g.draft.borrow().as_ref().is_some_and(|d| d.erasing()));
     let done = rect(left, client.bottom - s(MARGIN) - s(BUTTON), right, client.bottom - s(MARGIN));
     let erase_note = rect(left, done.top - s(8) - s(72), right, done.top - s(8));
-    let (preview, (magic, eraser, undo)) = if erasing {
-        let tools = erase_note.top - s(8) - s(SMALL_BUTTON) - s(4);
-        (rect(left, label.bottom, right, (tools - s(8)).max(preview.bottom)), row(tools))
+    let (preview, (magic, eraser, undo), size) = if erasing {
+        let size = rect(left, erase_note.top - s(8) - s(SLIDER), right, erase_note.top - s(8));
+        let tools = size.top - s(4) - s(SMALL_BUTTON) - s(4);
+        (rect(left, label.bottom, right, (tools - s(8)).max(preview.bottom)), row(tools), size)
     } else {
-        (preview, row(preview.bottom + s(8)))
+        (preview, row(preview.bottom + s(8)), rect(0, 0, 0, 0))
     };
     let ends = rect(left, eraser.bottom + s(8), right, eraser.bottom + s(8) + s(18));
     let slider = rect(left, ends.bottom, right, ends.bottom + s(SLIDER));
@@ -396,7 +402,7 @@ fn layout(hwnd: HWND, ui: &Ui) -> Layout {
     let save = rect(left, buttons, middle - s(4), buttons + s(BUTTON));
     let discard = rect(middle + s(4), buttons, right, buttons + s(BUTTON));
     let draft_note = rect(left, save.bottom + s(10), right, client.bottom - s(MARGIN));
-    Layout { capture, note, list, label, preview, magic, eraser, undo, done, erase_note, ends, slider, toggles, note_label, note_field, save, discard, draft_note }
+    Layout { capture, note, list, label, preview, magic, eraser, undo, size, done, erase_note, ends, slider, toggles, note_label, note_field, save, discard, draft_note }
 }
 
 /// Riquadro della firma, tasto elimina e didascalia della riga indicata.
@@ -409,13 +415,8 @@ fn row_rects(ui: &Ui, l: &Layout, index: usize) -> (RECT, RECT, RECT) {
     (image, remove, rect(image.left, image.bottom, image.right, image.bottom + s(CAPTION)))
 }
 
-/// Asse dello slider: un po' di respiro ai lati per il pomello.
-fn track(ui: &Ui, slider: RECT) -> (i32, i32) {
-    (slider.left + scale(ui, 10), slider.right - scale(ui, 10))
-}
-
 fn darkness_at(ui: &Ui, l: &Layout, x: i32) -> i32 {
-    let (a, b) = track(ui, l.slider);
+    let (a, b) = slider_track(ui, l.slider);
     let t = (x - a).clamp(0, (b - a).max(1)) as f64 / (b - a).max(1) as f64;
     ((t * 2.0 - 1.0) * DARKNESS_RANGE as f64).round() as i32
 }
@@ -440,6 +441,9 @@ pub(super) fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> SigHit {
             return if strokes > 0 { SigHit::Undo } else { SigHit::Nothing };
         }
         if erasing {
+            if l.size.contains(x, y) {
+                return SigHit::Size;
+            }
             return if l.done.contains(x, y) { SigHit::Done } else { SigHit::Nothing };
         }
         if l.slider.contains(x, y) {
@@ -652,6 +656,7 @@ fn paint_draft(dc: HDC, ui: &Ui, l: &Layout, hover: SigHit) {
             let corner = rect(l.preview.left, l.preview.bottom - s(22), l.preview.right - s(8), l.preview.bottom - s(4));
             draw_text(dc, &badge, corner, fonts.small, colors.muted, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
         }
+        paint_eraser_size(dc, ui, l.size, hover == SigHit::Size || SIGS.with(|g| g.sizing.get()));
         draw_text(dc, ERASE_HINT, l.erase_note, fonts.small, colors.muted, DT_WORDBREAK | DT_NOPREFIX);
         paint_button(dc, ui, l.done, "Fine", true, true, hover == SigHit::Done);
         return;
@@ -659,7 +664,7 @@ fn paint_draft(dc: HDC, ui: &Ui, l: &Layout, hover: SigHit) {
 
     draw_text(dc, "più chiara", l.ends, fonts.small, colors.muted, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     draw_text(dc, "più scura", l.ends, fonts.small, colors.muted, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_RIGHT);
-    let (a, b) = track(ui, l.slider);
+    let (a, b) = slider_track(ui, l.slider);
     let cy = (l.slider.top + l.slider.bottom) / 2;
     fill_round_rect(dc, rect(a, cy - s(2), b, cy + s(2)), s(4), colors.track);
     let middle = (a + b) / 2;
@@ -690,30 +695,8 @@ fn paint_eraser(dc: HDC, ui: &Ui, l: &Layout, draft: &Draft, hovered: bool) {
     if !draft.erasing() {
         return;
     }
-    let colors = ui.palette.get();
-    let r = scale(ui, ERASER);
-    unsafe {
-        let saved = SaveDC(dc);
-        IntersectClipRect(dc, l.preview.left, l.preview.top, l.preview.right, l.preview.bottom);
-        if !draft.live.is_empty() {
-            let mut points = draft.live.clone();
-            if points.len() == 1 {
-                points.push(points[0]);
-            }
-            with_pen(dc, PS_SOLID, 2 * r, colors.primary, || {
-                Polyline(dc, points.as_ptr(), points.len() as i32);
-            });
-        }
-        if hovered || !draft.live.is_empty() {
-            let p = SIGS.with(|g| g.pointer.get());
-            let old = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            with_pen(dc, PS_SOLID, scale(ui, 1).max(1), colors.err, || {
-                Ellipse(dc, p.x - r, p.y - r, p.x + r + 1, p.y + r + 1);
-            });
-            SelectObject(dc, old);
-        }
-        RestoreDC(dc, saved);
-    }
+    let pointer = (hovered || !draft.live.is_empty()).then(|| SIGS.with(|g| g.pointer.get()));
+    paint_brush(dc, ui, l.preview, &draft.live, pointer);
 }
 
 // ---------- input ----------
@@ -754,6 +737,12 @@ pub(super) fn mouse_down(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> bool {
             unsafe { SetCapture(hwnd) };
             true
         }
+        SigHit::Size => {
+            SIGS.with(|g| g.sizing.set(true));
+            unsafe { SetCapture(hwnd) };
+            set_eraser_size_at(ui, layout(hwnd, ui).size, x);
+            true
+        }
         SigHit::Slider => {
             SIGS.with(|g| g.sliding.set(true));
             unsafe { SetCapture(hwnd) };
@@ -783,6 +772,12 @@ pub(super) fn mouse_move(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> bool {
             return true;
         }
     }
+    if SIGS.with(|g| g.sizing.get()) {
+        if set_eraser_size_at(ui, layout(hwnd, ui).size, x) {
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+        }
+        return true;
+    }
     if SIGS.with(|g| g.sliding.get()) {
         let value = darkness_at(ui, &layout(hwnd, ui), x);
         if set_options(|o| o.darkness = value) {
@@ -807,13 +802,25 @@ pub(super) fn mouse_move(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> bool {
     true
 }
 
+/// Azzera trascinamento/passata se il sistema toglie la cattura del mouse (WM_CAPTURECHANGED).
+pub(super) fn cancel_capture() {
+    SIGS.with(|g| {
+        g.press.set(None);
+        g.sliding.set(false);
+        g.sizing.set(false);
+        if let Some(draft) = g.draft.borrow_mut().as_mut() {
+            draft.live.clear();
+        }
+    });
+}
+
 /// Tasto sinistro rilasciato: fine dello slider o clic su una firma (copia). Vero se gestito.
 pub(super) fn mouse_up(hwnd: HWND, ui: &Ui) -> bool {
     if finish_stroke(hwnd, ui) {
         unsafe { ReleaseCapture() };
         return true;
     }
-    if SIGS.with(|g| g.sliding.replace(false)) {
+    if SIGS.with(|g| g.sliding.replace(false) | g.sizing.replace(false)) {
         unsafe { ReleaseCapture() };
         return true;
     }
@@ -826,7 +833,7 @@ pub(super) fn mouse_up(hwnd: HWND, ui: &Ui) -> bool {
 /// Fine della passata di gomma: riportata sulla sorgente e firma ripulita. Vero se c'era una passata.
 fn finish_stroke(hwnd: HWND, ui: &Ui) -> bool {
     let area = layout(hwnd, ui).preview;
-    let radius = scale(ui, ERASER) as f32;
+    let radius = eraser_radius(ui) as f32;
     SIGS.with(|g| {
         let mut draft = g.draft.borrow_mut();
         let Some(draft) = draft.as_mut() else { return false };
@@ -899,7 +906,7 @@ pub(super) fn on_click(hwnd: HWND, hit: SigHit) {
         SigHit::Delete(index) => delete(index),
         SigHit::Save => save(hwnd),
         SigHit::Discard => SIGS.with(|g| *g.draft.borrow_mut() = None),
-        SigHit::Item(_) | SigHit::Slider | SigHit::Preview | SigHit::Nothing => {}
+        SigHit::Item(_) | SigHit::Slider | SigHit::Size | SigHit::Preview | SigHit::Nothing => {}
     }
 }
 
@@ -938,7 +945,7 @@ fn delete(index: usize) {
 
 /// Menu a comparsa nel punto indicato (coordinate dello schermo). Id 0 = separatore.
 /// Restituisce l'id scelto, 0 se annullato.
-fn popup(owner: HWND, items: &[(usize, String)], at: POINT) -> usize {
+pub(super) fn popup(owner: HWND, items: &[(usize, String)], at: POINT) -> usize {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() {

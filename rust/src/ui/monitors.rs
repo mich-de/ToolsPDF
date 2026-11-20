@@ -14,6 +14,8 @@ pub(crate) struct Monitor {
     /// Numero del dispositivo (\\.\DISPLAYn): resta lo stesso tra un avvio e l'altro.
     pub number: u32,
     pub rect: RECT,
+    /// Area di lavoro senza la barra delle applicazioni (usata in modalita' "Sopra le finestre").
+    pub work: RECT,
     pub primary: bool,
     pub dpi: u32,
     /// Nome per le impostazioni, in base alla posizione da sinistra.
@@ -47,6 +49,7 @@ unsafe extern "system" fn collect(handle: HMONITOR, _: HDC, _: *mut RECT, data: 
         found.push(Monitor {
             number: device_number(&device).unwrap_or(found.len() as u32 + 1),
             rect: info.monitorInfo.rcMonitor,
+            work: info.monitorInfo.rcWork,
             primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
             dpi: dpi_x.max(48),
             label: String::new(),
@@ -102,7 +105,8 @@ mod tests {
     use super::*;
 
     fn screen(number: u32, left: i32, width: i32, primary: bool) -> Monitor {
-        Monitor { number, rect: RECT { left, top: 0, right: left + width, bottom: 1440 }, primary, dpi: 120, label: String::new() }
+        let r = RECT { left, top: 0, right: left + width, bottom: 1440 };
+        Monitor { number, rect: r, work: r, primary, dpi: 120, label: String::new() }
     }
 
     #[test]

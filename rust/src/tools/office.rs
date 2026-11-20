@@ -76,18 +76,17 @@ pub fn to_pdf(file: &Loaded, work_dir: &Path, progress: Progress) -> Result<Vec<
         (None, None) => return Err(Error::msg("file vuoto")),
     };
     let input = fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
-    let input = input.to_string_lossy();
-    let input = input.strip_prefix(r"\\?\").unwrap_or(&input);
+    let input = strip_verbatim(&input);
     let target = absolute(&output.0);
 
     match file.kind {
         Kind::Word => {
             progress(0.1, "Conversione con Word…");
-            word_to_pdf(input, &target)?;
+            word_to_pdf(&input, &target)?;
         }
         Kind::Excel => {
             progress(0.1, "Conversione con Excel…");
-            excel_to_pdf(input, &target)?;
+            excel_to_pdf(&input, &target)?;
         }
         _ => return Err(Error::msg("formato non convertibile")),
     }
@@ -95,13 +94,24 @@ pub fn to_pdf(file: &Loaded, work_dir: &Path, progress: Progress) -> Result<Vec<
 }
 
 fn absolute(path: &Path) -> String {
-    let parent = path.parent().and_then(|p| fs::canonicalize(p).ok());
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).and_then(|p| fs::canonicalize(p).ok());
     let full = match (parent, path.file_name()) {
         (Some(parent), Some(name)) => parent.join(name),
         _ => path.to_path_buf(),
     };
-    let text = full.to_string_lossy().into_owned();
-    text.strip_prefix(r"\\?\").map_or(text.clone(), str::to_string)
+    strip_verbatim(&full)
+}
+
+/// Toglie il prefisso verbatim \\?\ preservando i percorsi di rete UNC (\\?\UNC\server\share -> \\server\share).
+fn strip_verbatim(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(plain) = text.strip_prefix(r"\\?\") {
+        plain.to_string()
+    } else {
+        text.into_owned()
+    }
 }
 
 /// Word invisibile, senza avvisi e con le macro disattivate.
@@ -331,5 +341,17 @@ impl Disp {
 
 fn is_busy(code: HRESULT) -> bool {
     code == RPC_E_CALL_REJECTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_verbatim_handles_local_and_unc_paths() {
+        assert_eq!(strip_verbatim(Path::new(r"\\?\C:\Docs\prova.docx")), r"C:\Docs\prova.docx");
+        assert_eq!(strip_verbatim(Path::new(r"\\?\UNC\server\share\dir\prova.docx")), r"\\server\share\dir\prova.docx");
+        assert_eq!(strip_verbatim(Path::new(r"C:\Docs\prova.docx")), r"C:\Docs\prova.docx");
+    }
 }
 

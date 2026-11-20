@@ -2,7 +2,7 @@
 
 ```yaml
 registro_codebase:
-  ultimo_aggiornamento: "2026-11-12 (gomma magica, ocrs, remap percorsi, consiglio OneDrive, cartella fissa di output); prima 2026-11-11 (1.2.0 Firme: passi 1-9 fatti in locale, da provare dal vivo; release non pubblicata)"
+  ultimo_aggiornamento: "2026-11-20 (compilata la 1.3.0: fix import windows-sys/VARIANT dello scanner, pannello Scanner collegato a Mode::Scanner, tasto Scanner e banner aggiornamento nella barra, set_topmost del pannello, WM_CAPTURECHANGED per Firme/Foto; prima 2026-11-13 13:30 (VERSIONE 1.3.0 al posto della 1.2.0 mai pubblicata; misura della gomma condivisa Firme/Foto: paint::ERASER_SIZES/eraser_radius/paint_eraser_size/set_eraser_size_at; slider comuni paint::slider_track/slider_fraction/paint_slider; foto: zoom solo di vista con la gomma, Draft.view); prima 2026-11-13 pomeriggio (foto tessera: keep_main_subject toglie oggetti staccati dalla persona, Gomma magica/Gomma/Annulla nell'editor, paint_brush/ERASER condivisi in paint.rs, brush/blobs di signature pub(super)); prima 2026-11-13 (cartella di output per zona in Impostazioni con scorrimento, popup Novita src/news.rs, update::cleanup -> bool); prima 2026-11-12 sera (foto tessera: portrait.rs, photo_panel.rs, zona propria ZONE_PHOTO=6 (Unisci diventa 7, 8 zone)); prima 2026-11-12 (gomma magica, ocrs, remap percorsi, consiglio OneDrive, cartella fissa di output); prima 2026-11-11 (1.2.0 Firme: passi 1-9 fatti in locale, da provare dal vivo; release non pubblicata)"
   ultima_pulizia: "2026-11-05"
 
   moduli_esistenti:
@@ -78,10 +78,26 @@ registro_codebase:
       file: "rust/src/tools/form_text.rs"
       responsabilita: "scritte stampate dei moduli accanto alle firme con OCR ocrs (Rust puro, modelli in rust/models dentro l'exe): solo righe con parole dei moduli, tolleranti a errori e tagli"
       funzioni_chiave: ["printed_boxes", "pick", "split", "known", "distance (Levenshtein)", "KEYWORDS"]
+    - nome: "portrait"
+      file: "rust/src/tools/portrait.rs"
+      responsabilita: "foto tessera: sfondo staccato con U-2-Net (u2netp.onnx dentro l'exe, rten), bordi col filtro guidato, colori del bordo ripuliti dal vecchio sfondo, piramide premoltiplicata, messa a fuoco (maschera di contrasto sulla luminanza), ritaglio sui formati con guide ICAO, PNG/JPEG a 600 DPI"
+      funzioni_chiave: ["FORMATS/Format (pixels, guides)", "Guides", "Background", "Crop (moved, zoomed)", "Photo::new(img, sharpen) (+ keep_main_subject)", "set_sharpen", "add_stroke/undo_stroke/stroke_count (Stroke di signature, magic = pezzi con >= 80% dentro la passata)", "rebuild_alpha/rebuild_levels", "erase", "SUBJECT_LINK 0.12 / SUBJECT_KEEP 0.25", "fit (testa dalla sagoma)", "render (Lanczos)", "preview (BGRA bilineare)", "low_resolution", "encode", "save_beside (_fototessera)", "decode", "mask/refine/box_mean/premultiplied/sharpen/head"]
+    - nome: "photo_panel"
+      file: "rust/src/ui/photo_panel.rs"
+      responsabilita: "editor foto tessera (zona ZONE_PHOTO, Mode::Photo del pannello, drop DROP_PHOTO=4, stato vuoto): formato da menu, riquadro con guide, trascina = sposta, rotella = zoom verso il mouse, slider zoom + Adatta, slider Messa a fuoco (ricalcolo al rilascio), avviso foto piccola, Sfondo bianco/Trasparente, Salva foto (cartella fissa o accanto, altrimenti dialogo) + appunti, Scarta; riga [Gomma magica][Gomma][Annulla (n)] sotto il suggerimento: con una gomma attiva il trascinamento sul riquadro disegna la passata (non sposta), ricalcolo al rilascio (finish_stroke), stesso tasto due volte = spenta"
+      funzioni_chiave: ["PhotoHit", "has_photo", "load_dropped(source) (sfondo = ultimo scelto)", "DROP_PHOTO", "hit_test", "paint", "mouse_down/mouse_move/mouse_up(hwnd, ui)", "finish_stroke", "zoom (con la gomma: solo Draft.view, max ERASE_ZOOM_MAX=6x, il ritaglio non cambia)", "Draft::shown", "PhotoHit::Size (riga dello zoom con la gomma attiva)", "on_click"]
+    - nome: "scanner"
+      file: "rust/src/tools/scanner.rs"
+      responsabilita: "scansione WIA 2.0 (COM di sistema, zero DLL esterne e zero file temporanei): elenco scanner, sorgente vetro o alimentatore ADF, colore/grigi/B-N, 150/200/300 DPI, pagine tenute in memoria e assemblate in PDF multipagina"
+      funzioni_chiave: ["ScannerInfo", "ScanSource/ColorMode/ScanOptions", "DPI_CHOICES", "list_scanners", "scan (Transfer BMP, ADF fino a MAX_ADF_PAGES, WIA_ERROR_PAPER_EMPTY)", "pages_to_pdf", "default_name", "Disp (IDispatch late binding)", "extract_safearray_bytes"]
+    - nome: "scanner_panel"
+      file: "rust/src/ui/scanner_panel.rs"
+      responsabilita: "pannello Scanner (tasto nell'intestazione, visibile solo se WIA trova almeno uno scanner): scelta dispositivo, sorgente vetro/ADF, colore e DPI, Acquisisci in sottofondo, pagine in memoria con Togli ultima/Svuota, invio a Testo (OCR) o Comprimi"
+      funzioni_chiave: ["ScanHit", "hit_test", "paint", "on_click", "start_scan", "dispatch_pages", "on_scanners_refreshed", "page_word"]
     - nome: "signatures_panel"
       file: "rust/src/ui/signatures_panel.rs"
       responsabilita: "pannello Firme: tasto Cattura, elenco firme salvate su scacchiera (clic = copia, trascinamento = drag_file, tasto destro = Copia/Elimina/Apri cartella), bozza con anteprima, gomma magica e normale (Gomma magica/Gomma/Annulla/Fine, anteprima grande con zoom a rotella, passate in pixel sorgente) e slider piu chiara/piu scura, spunte Rendi nera/Stampa/Togli righe, Salva (salva + appunti)/Scarta; immagine trascinata = bozza; menu firme salvate per Strumenti > Firma"
-      funzioni_chiave: ["SigHit", "reload", "load_dropped", "hit_test", "paint", "mouse_down/mouse_move/mouse_up", "context_menu", "on_click", "pick_for_tools -> Pick", "is_dragging (drop_target ignora le firme in uscita)", "popup", "label"]
+      funzioni_chiave: ["SigHit", "reload", "load_dropped", "hit_test", "paint", "mouse_down/mouse_move/mouse_up", "context_menu", "on_click", "pick_for_tools -> Pick", "is_dragging (drop_target ignora le firme in uscita)", "popup (anche per i formati foto)", "label"]
     - nome: "capture"
       file: "rust/src/ui/capture.rs"
       responsabilita: "copia dello schermo virtuale (BitBlt in DIB) prima della finestra di selezione, immagine congelata scurita, rettangolo col trascinamento, Esc/tasto destro annullano (timer GetAsyncKeyState se manca il fuoco); nasconde le finestre indicate durante la copia"
@@ -104,12 +120,16 @@ registro_codebase:
       funzioni_chiave: ["is_temporary"]
     - nome: "ui"
       file: "rust/src/ui/"
-      responsabilita: "appbar, 6 zone (Comprimi, Dividi, Testo, Word, Strumenti, Unisci), vassoio Unisci, tasto cartella, coda di lavoro; thread anteprime con PreviewJob (Tray, Tools, Unlock)"
-      funzioni_chiave: ["run", "wnd_proc", "on_drop", "process_one", "process_join", "process_tools", "start_tools", "load_tools_doc", "unlock_tools_doc", "beside", "reveal", "drop_target::register(hwnd, Target)", "dialogs::pick_file", "dialogs::pick_folder(nome cartella completo)", "dialogs::pick_image", "paint::paint", "start_update_checks", "offer_update", "offer_restart"]
+      responsabilita: "appbar, 8 zone (Comprimi, Dividi, Testo, Word, Strumenti, Firme, Foto tessera, Unisci), vassoio Unisci, tasto cartella, coda di lavoro; banner aggiornamento sotto le zone; scanner WIA cercati in sottofondo; thread anteprime con PreviewJob (Tray, Tools, Unlock)"
+      funzioni_chiave: ["run", "wnd_proc", "on_drop", "process_one", "process_join", "process_tools", "start_tools", "load_tools_doc", "unlock_tools_doc", "beside", "reveal", "drop_target::register(hwnd, Target)", "dialogs::pick_file", "dialogs::pick_folder(nome cartella completo)", "dialogs::pick_image", "paint::paint", "paint::scanner_rect/update_banner_rect", "refresh_scanners", "send_scanned_pdf", "start_update_checks", "handle_update_action", "offer_update", "offer_restart"]
     - nome: "update"
       file: "rust/src/update.rs"
       responsabilita: "aggiornamento da GitHub (mich-de/ToolsPDF): WinHTTP col proxy di sistema, /releases/latest/download/version.txt (versione + SHA-256, niente API e niente limiti), exe scaricato accanto a quello in uso (.new), verifica BCrypt SHA-256, scambio .old/.new; unico accesso alla rete; spegnibile con aggiornamenti=mai"
-      funzioni_chiave: ["latest", "parse_version_file", "is_newer", "install", "cleanup", "get", "sha256"]
+      funzioni_chiave: ["latest", "parse_version_file", "is_newer", "install", "cleanup -> bool (appena aggiornato)", "get", "sha256"]
+    - nome: "news"
+      file: "rust/src/news.rs"
+      responsabilita: "novita di ogni versione dentro l exe; popup una volta al primo avvio dopo l aggiornamento (mai al primo uso); ini novita_viste="
+      funzioni_chiave: ["NEWS", "of", "should_show", "ui::show_news (WM_UPDATE wparam WPARAM_NEWS)"]
     - nome: "release.ps1"
       file: "release.ps1"
       responsabilita: "pubblica una versione: controlla git pulito e versione nuova, test, build, version.txt con impronta, gh release create vX.Y.Z"

@@ -337,7 +337,7 @@ fn split_mixed(blob: &Blob, w: usize, brushed: &[bool]) -> Vec<usize> {
 }
 
 /// Segna i pixel coperti dalla passata: dischi ravvicinati lungo il tratto.
-fn brush(brushed: &mut [bool], w: usize, h: usize, stroke: &Stroke) {
+pub(super) fn brush(brushed: &mut [bool], w: usize, h: usize, stroke: &Stroke) {
     let r = stroke.radius.max(0.5);
     let mut stamp = |cx: f32, cy: f32| {
         let (x0, x1) = (((cx - r).floor().max(0.0)) as usize, ((cx + r).ceil().max(0.0) as usize).min(w.saturating_sub(1)));
@@ -686,8 +686,8 @@ fn otsu(histogram: &[u32; 256], upto: usize) -> i32 {
 }
 
 /// Gruppo di pixel 8-connessi.
-struct Blob {
-    pixels: Vec<usize>,
+pub(super) struct Blob {
+    pub(super) pixels: Vec<usize>,
     /// Somma delle alfa in 0..1.
     weight: f64,
     x0: usize,
@@ -740,7 +740,7 @@ fn distance_map(ink: &[bool], w: usize, h: usize) -> Vec<f64> {
 }
 
 /// Gruppi 8-connessi dei pixel con alfa almeno min.
-fn blobs(alpha: &[u8], w: usize, h: usize, min: u8) -> Vec<Blob> {
+pub(super) fn blobs(alpha: &[u8], w: usize, h: usize, min: u8) -> Vec<Blob> {
     let min = min.max(1);
     let mut seen = vec![false; alpha.len()];
     let mut stack = Vec::new();
@@ -1048,7 +1048,7 @@ fn timestamp() -> String {
 
 
 /// CF_DIBV5: BITMAPV5HEADER e pixel BGRA dal basso in alto, con alfa.
-/// Il colore e' nero, quindi alfa premoltiplicato o diretto danno lo stesso risultato.
+/// Funziona sia per le firme (nero + alfa) sia per le foto a colori (es. fototessera).
 pub fn dib_v5(image: &RgbaImage, dpi: u32) -> Vec<u8> {
     let (w, h) = image.dimensions();
     let mut out = Vec::with_capacity(124 + (w * h * 4) as usize);
@@ -1072,15 +1072,15 @@ pub fn dib_v5(image: &RgbaImage, dpi: u32) -> Vec<u8> {
     put(&mut out, &[0; 12]); // profilo e riservato
     for y in (0..h).rev() {
         for x in 0..w {
-            let a = image.get_pixel(x, y).0[3];
-            out.extend_from_slice(&[0, 0, 0, a]);
+            let [r, g, b, a] = image.get_pixel(x, y).0;
+            out.extend_from_slice(&[b, g, r, a]);
         }
     }
     out
 }
 
-/// CF_DIB per le app che ignorano la trasparenza: 24 bit, firma appoggiata su bianco.
-/// Senza questo Windows ricaverebbe il DIB dal V5 e la firma diventerebbe un rettangolo nero.
+/// CF_DIB per le app che ignorano la trasparenza: 24 bit, immagine appoggiata su bianco.
+/// Senza questo Windows ricaverebbe il DIB dal V5 e le aree trasparenti diventerebbero nere.
 pub fn dib_on_white(image: &RgbaImage, dpi: u32) -> Vec<u8> {
     let (w, h) = image.dimensions();
     let stride = (w as usize * 3).div_ceil(4) * 4;
@@ -1099,8 +1099,10 @@ pub fn dib_on_white(image: &RgbaImage, dpi: u32) -> Vec<u8> {
     for y in (0..h).rev() {
         let start = out.len();
         for x in 0..w {
-            let v = 255 - image.get_pixel(x, y).0[3];
-            out.extend_from_slice(&[v, v, v]);
+            let [r, g, b, a] = image.get_pixel(x, y).0;
+            let a = u16::from(a);
+            let blend = |c: u8| ((u16::from(c) * a + 255 * (255 - a) + 127) / 255) as u8;
+            out.extend_from_slice(&[blend(b), blend(g), blend(r)]);
         }
         out.resize(start + stride, 0);
     }

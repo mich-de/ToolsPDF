@@ -378,6 +378,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                 }
                 0
             }
+            WM_CLOSE | WM_DESTROY => {
+                finish(None);
+                0
+            }
             WM_DPICHANGED => 0,
             _ => DefWindowProcW(hwnd, message, wparam, lparam),
         }

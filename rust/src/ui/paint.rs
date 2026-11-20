@@ -2,15 +2,16 @@
 //! Le primitive qui sotto servono anche al pannello.
 
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use windows_sys::Win32::Foundation::{COLORREF, ERROR_SUCCESS, HWND, RECT};
+use windows_sys::Win32::Foundation::{COLORREF, ERROR_SUCCESS, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use super::win::{rect, wide, RectExt};
 use super::{
-    panel, scale, tray_len, with_rows, Hover, Row, RowState, Ui, APP_TITLE, VERSION, ZONE_COMPRESS, ZONE_COUNT, ZONE_JOIN, ZONE_SIGNATURES, ZONE_SPLIT, ZONE_TEXT, ZONE_TOOLS, ZONE_WORD,
+    has_scanner, panel, scale, tray_len, update_status, with_rows, Hover, Row, RowState, Ui, UpdateStatus, APP_TITLE, VERSION, ZONE_COMPRESS, ZONE_COUNT, ZONE_JOIN, ZONE_PHOTO, ZONE_SIGNATURES, ZONE_SPLIT, ZONE_TEXT, ZONE_TOOLS, ZONE_WORD,
 };
 use crate::settings::Theme;
 use crate::tools;
@@ -173,6 +174,11 @@ pub(crate) fn info_rect(hwnd: HWND, ui: &Ui) -> RECT {
     header_button(hwnd, ui, 1)
 }
 
+/// Tasto Scanner, solo se sul PC c'e' almeno uno scanner WIA.
+pub(crate) fn scanner_rect(hwnd: HWND, ui: &Ui) -> RECT {
+    header_button(hwnd, ui, 2)
+}
+
 /// Riquadro di una zona; quella di Unisci contiene anche i tasti.
 pub(crate) fn zone_rect(hwnd: HWND, ui: &Ui, index: usize) -> RECT {
     let s = |v| scale(ui, v);
@@ -199,6 +205,24 @@ pub(crate) fn clear_button(hwnd: HWND, ui: &Ui) -> RECT {
 
 fn rows_top(hwnd: HWND, ui: &Ui) -> i32 {
     zone_rect(hwnd, ui, ZONE_COUNT - 1).bottom + scale(ui, CAPTION_HEIGHT)
+}
+
+/// Riga sotto le zone quando c'e' qualcosa da dire sull'aggiornamento.
+pub(crate) fn update_banner_rect(hwnd: HWND, ui: &Ui) -> Option<RECT> {
+    update_banner_text()?;
+    let s = |v| scale(ui, v);
+    let last = zone_rect(hwnd, ui, ZONE_COUNT - 1);
+    Some(rect(s(MARGIN), last.bottom + s(2), client_rect(hwnd).right - s(MARGIN), rows_top(hwnd, ui) - s(2)))
+}
+
+fn update_banner_text() -> Option<String> {
+    match update_status() {
+        UpdateStatus::Available(release) => Some(format!("Aggiornamento {} disponibile: clicca per scaricare", release.version)),
+        UpdateStatus::Downloading(version) => Some(format!("Scarico l'aggiornamento {version}…")),
+        UpdateStatus::Ready(version) => Some(format!("Aggiornamento {version} pronto: clicca per riavviare")),
+        UpdateStatus::Error(err) => Some(format!("Aggiornamenti non riusciti ({err}): clicca per riprovare")),
+        UpdateStatus::Idle | UpdateStatus::Checking | UpdateStatus::UpToDate => None,
+    }
 }
 
 fn folder_button(ui: &Ui, right: i32, row_y: i32) -> RECT {
@@ -306,6 +330,13 @@ fn paint_top(dc: HDC, hwnd: HWND, ui: &Ui, w: i32) {
     }
     paint_info_icon(dc, ui, info);
     paint_gear_icon(dc, ui, settings);
+    if has_scanner() {
+        let scanner = scanner_rect(hwnd, ui);
+        if hover == Hover::Scanner || mode == panel::Mode::Scanner {
+            fill_round_rect(dc, scanner, s(6), colors.track);
+        }
+        paint_scanner_icon(dc, ui, scanner);
+    }
     let inset = s(11);
     with_pen(dc, PS_SOLID, s(1) + 1, colors.fg, || {
         line(dc, close.left + inset, close.top + inset, close.right - inset, close.bottom - inset);
@@ -316,8 +347,35 @@ fn paint_top(dc: HDC, hwnd: HWND, ui: &Ui, w: i32) {
         paint_zone(dc, hwnd, ui, index);
     }
     let last = zone_rect(hwnd, ui, ZONE_COUNT - 1);
-    draw_text(dc, "PDF, immagini, Word, Excel", rect(s(MARGIN), last.bottom, w - s(MARGIN), rows_top(hwnd, ui)),
-        fonts.small, colors.muted, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_CENTER | DT_END_ELLIPSIS);
+    if let Some(text) = update_banner_text() {
+        if let Some(banner) = update_banner_rect(hwnd, ui) {
+            let hot = hover == Hover::UpdateBanner;
+            fill_round_rect(dc, banner, s(5), if hot { colors.tint } else { colors.card });
+            with_pen(dc, PS_SOLID, 1, colors.border, || outline(dc, banner.left, banner.top, banner.right - 1, banner.bottom - 1));
+            let inner = rect(banner.left + s(6), banner.top, banner.right - s(6), banner.bottom);
+            draw_text(dc, &text, inner, fonts.small, colors.primary, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+    } else {
+        draw_text(dc, "PDF, immagini, Word, Excel", rect(s(MARGIN), last.bottom, w - s(MARGIN), rows_top(hwnd, ui)),
+            fonts.small, colors.muted, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_CENTER | DT_END_ELLIPSIS);
+    }
+}
+
+/// Scanner: corpo piatto con il coperchio sollevato.
+fn paint_scanner_icon(dc: HDC, ui: &Ui, r: RECT) {
+    let s = |v| scale(ui, v);
+    let colors = ui.palette.get();
+    let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    with_pen(dc, PS_SOLID, s(1) + 1, colors.fg, || {
+        line(dc, cx - s(7), cy + s(3), cx + s(7), cy + s(3));
+        line(dc, cx - s(7), cy + s(3), cx - s(7), cy + s(7));
+        line(dc, cx + s(7), cy + s(3), cx + s(7), cy + s(7));
+        line(dc, cx - s(7), cy + s(7), cx + s(7), cy + s(7));
+        line(dc, cx - s(5), cy + s(5), cx + s(5), cy + s(5));
+        line(dc, cx - s(6), cy - s(6), cx + s(6), cy - s(6));
+        line(dc, cx - s(6), cy - s(6), cx - s(6), cy);
+        line(dc, cx + s(6), cy - s(6), cx + s(6), cy);
+    });
 }
 
 /// Cerchio con la "i".
@@ -364,7 +422,8 @@ fn paint_zone(dc: HDC, hwnd: HWND, ui: &Ui, index: usize) {
     let active = ui.drag_zone.get() == Some(index);
     let hovered = (index == ZONE_JOIN && ui.hover.get() == Hover::JoinZone)
         || (index == ZONE_TOOLS && (ui.hover.get() == Hover::ToolsZone || panel::mode() == panel::Mode::Tools))
-        || (index == ZONE_SIGNATURES && (ui.hover.get() == Hover::SignaturesZone || panel::mode() == panel::Mode::Signatures));
+        || (index == ZONE_SIGNATURES && (ui.hover.get() == Hover::SignaturesZone || panel::mode() == panel::Mode::Signatures))
+        || (index == ZONE_PHOTO && (ui.hover.get() == Hover::PhotoZone || panel::mode() == panel::Mode::Photo));
 
     fill_round_rect(dc, zone, s(8), if active || hovered { colors.tint } else { colors.card });
     let style = if active { PS_SOLID } else { PS_DASH };
@@ -386,6 +445,7 @@ fn paint_zone(dc: HDC, hwnd: HWND, ui: &Ui, index: usize) {
         ZONE_WORD => ("Word", "PDF e scansioni in docx".to_string()),
         ZONE_TOOLS => ("Strumenti", "ruota, timbro, firma…".to_string()),
         ZONE_SIGNATURES => ("Firme", "cattura, copia, trascina".to_string()),
+        ZONE_PHOTO => ("Foto tessera", "sfondo bianco, 35x45…".to_string()),
         _ => (
             "Unisci",
             match tray {
@@ -473,6 +533,18 @@ fn paint_zone_icon(dc: HDC, ui: &Ui, index: usize, r: RECT) {
             for pair in points.windows(2) {
                 let ((x1, y1), (x2, y2)) = (pair[0], pair[1]);
                 line(dc, r.left + s(x1), r.top + s(y1), r.left + s(x2), r.top + s(y2));
+            }
+        }
+        // Fototessera: cornice con testa e spalle.
+        ZONE_PHOTO => {
+            let (left, right) = (r.left + s(4), r.right - s(4));
+            outline(dc, left, r.top + s(1), right, r.bottom - s(1));
+            unsafe {
+                let saved = SaveDC(dc);
+                SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Ellipse(dc, cx - s(4), r.top + s(5), cx + s(5), r.top + s(14));
+                Arc(dc, left + s(3), r.top + s(15), right - s(3), r.bottom + s(9), right - s(3), r.bottom - s(1), left + s(3), r.bottom - s(1));
+                RestoreDC(dc, saved);
             }
         }
         // Piu': aggiunta al vassoio.
@@ -578,6 +650,150 @@ pub(crate) fn fill_round_rect(dc: HDC, r: RECT, radius: i32, color: COLORREF) {
         });
         SelectObject(dc, old);
         DeleteObject(brush);
+    }
+}
+
+/// Raggi della gomma sullo schermo (Firme e Foto tessera), dal piu' piccolo.
+const ERASER_SIZES: [i32; 5] = [4, 9, 14, 20, 30];
+/// Misura scelta, comune ai due pannelli; vale per la sessione.
+static ERASER_STEP: AtomicUsize = AtomicUsize::new(1);
+
+fn eraser_step() -> usize {
+    ERASER_STEP.load(Ordering::Relaxed).min(ERASER_SIZES.len() - 1)
+}
+
+/// Raggio della gomma sullo schermo, in pixel.
+pub(crate) fn eraser_radius(ui: &Ui) -> i32 {
+    scale(ui, ERASER_SIZES[eraser_step()])
+}
+
+/// Riga "Misura  piccola --o-- grande  (o)": etichetta, slider, cerchio.
+fn eraser_size_parts(ui: &Ui, area: RECT) -> (RECT, RECT, RECT, RECT) {
+    let s = |v| scale(ui, v);
+    let label = rect(area.left, area.top, area.left + s(52), area.bottom);
+    let small = rect(label.right, area.top, label.right + s(48), area.bottom);
+    let circle = rect(area.right - (area.bottom - area.top), area.top, area.right, area.bottom);
+    let big = rect(circle.left - s(48), area.top, circle.left - s(4), area.bottom);
+    (label, small, rect(small.right, area.top, big.left, area.bottom), big)
+}
+
+/// Slider della misura della gomma con il cerchio della misura accanto (in scala sulla riga).
+pub(crate) fn paint_eraser_size(dc: HDC, ui: &Ui, area: RECT, active: bool) {
+    let colors = ui.palette.get();
+    let fonts = ui.fonts.get();
+    let (label, small, slider, big) = eraser_size_parts(ui, area);
+    let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+    draw_text(dc, "Misura", label, fonts.small, colors.muted, flags);
+    draw_text(dc, "piccola", small, fonts.small, colors.muted, flags);
+    draw_text(dc, "grande", big, fonts.small, colors.muted, flags | DT_RIGHT);
+    let last = (ERASER_SIZES.len() - 1) as f32;
+    paint_slider(dc, ui, slider, eraser_step() as f32 / last, active);
+    let half = (area.bottom - area.top) / 2;
+    let r = 2 + ((half - 3) as f32 * eraser_step() as f32 / last) as i32;
+    let (cx, cy) = (area.right - half, area.top + half);
+    unsafe {
+        let old = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        with_pen(dc, PS_SOLID, scale(ui, 1).max(1), colors.err, || {
+            Ellipse(dc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+        });
+        SelectObject(dc, old);
+    }
+}
+
+/// Misura dalla posizione del mouse sulla riga. Vero se e' cambiata.
+pub(crate) fn set_eraser_size_at(ui: &Ui, area: RECT, x: i32) -> bool {
+    let (_, _, slider, _) = eraser_size_parts(ui, area);
+    let step = (slider_fraction(ui, slider, x) * (ERASER_SIZES.len() - 1) as f32).round() as usize;
+    ERASER_STEP.swap(step, Ordering::Relaxed) != step
+}
+
+/// Asse di uno slider: respiro ai lati per il pomello.
+pub(crate) fn slider_track(ui: &Ui, slider: RECT) -> (i32, i32) {
+    (slider.left + scale(ui, 10), slider.right - scale(ui, 10))
+}
+
+/// Posizione 0..1 del mouse sullo slider.
+pub(crate) fn slider_fraction(ui: &Ui, slider: RECT, x: i32) -> f32 {
+    let (a, b) = slider_track(ui, slider);
+    (x - a).clamp(0, (b - a).max(1)) as f32 / (b - a).max(1) as f32
+}
+
+/// Slider con pomello alla posizione t (0..1); piu' grande se attivo.
+pub(crate) fn paint_slider(dc: HDC, ui: &Ui, slider: RECT, t: f32, active: bool) {
+    let s = |v| scale(ui, v);
+    let colors = ui.palette.get();
+    let (a, b) = slider_track(ui, slider);
+    let cy = (slider.top + slider.bottom) / 2;
+    fill_round_rect(dc, rect(a, cy - s(2), b, cy + s(2)), s(4), colors.track);
+    let x = a + ((b - a) as f32 * t.clamp(0.0, 1.0)) as i32;
+    let knob = if active { s(10) } else { s(8) };
+    fill_round_rect(dc, rect(x - knob, cy - knob, x + knob, cy + knob), 2 * knob, colors.primary);
+}
+
+/// Gomma su un'anteprima: passata in corso (tratto pieno del colore principale, largo quanto la
+/// gomma) e cerchio rosso sotto il mouse; tutto ritagliato all'area.
+pub(crate) fn paint_brush(dc: HDC, ui: &Ui, area: RECT, live: &[POINT], pointer: Option<POINT>) {
+    let colors = ui.palette.get();
+    let r = eraser_radius(ui);
+    unsafe {
+        let saved = SaveDC(dc);
+        IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
+        if !live.is_empty() {
+            let mut points = live.to_vec();
+            if points.len() == 1 {
+                points.push(points[0]);
+            }
+            with_pen(dc, PS_SOLID, 2 * r, colors.primary, || {
+                Polyline(dc, points.as_ptr(), points.len() as i32);
+            });
+        }
+        if let Some(p) = pointer {
+            let old = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            with_pen(dc, PS_SOLID, scale(ui, 1).max(1), colors.err, || {
+                Ellipse(dc, p.x - r, p.y - r, p.x + r + 1, p.y + r + 1);
+            });
+            SelectObject(dc, old);
+        }
+        RestoreDC(dc, saved);
+    }
+    if let Some(p) = pointer {
+        paint_loupe(dc, ui, area, p, r);
+    }
+}
+
+/// Diametro della lente della gomma sullo schermo.
+const LOUPE: i32 = 120;
+/// Ingrandimento della lente (meno se la gomma e' grande: deve starci tutta).
+const LOUPE_ZOOM: i32 = 3;
+
+/// Lente rotonda accanto al puntatore (sopra, o sotto se manca spazio): la zona sotto la gomma,
+/// gia' disegnata nel buffer, ingrandita con il cerchio e la passata in corso.
+fn paint_loupe(dc: HDC, ui: &Ui, area: RECT, p: POINT, r: i32) {
+    let colors = ui.palette.get();
+    let d = scale(ui, LOUPE);
+    let half = (d / (2 * LOUPE_ZOOM)).max(r + scale(ui, 4));
+    let inside = |v: i32, lo: i32, hi: i32, m: i32| v.clamp(lo + m, (hi - m).max(lo + m));
+    let (sx, sy) = (inside(p.x, area.left, area.right, half) - half, inside(p.y, area.top, area.bottom, half) - half);
+    let gap = scale(ui, 24);
+    let cx = inside(p.x, area.left, area.right, d / 2);
+    let mut cy = p.y - half - gap - d / 2;
+    if cy - d / 2 < area.top {
+        cy = p.y + half + gap + d / 2;
+    }
+    let lens = rect(cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2);
+    unsafe {
+        let saved = SaveDC(dc);
+        let region = CreateEllipticRgn(lens.left, lens.top, lens.right + 1, lens.bottom + 1);
+        SelectClipRgn(dc, region);
+        SetStretchBltMode(dc, COLORONCOLOR);
+        StretchBlt(dc, lens.left, lens.top, d, d, dc, sx, sy, 2 * half, 2 * half, SRCCOPY);
+        RestoreDC(dc, saved);
+        DeleteObject(region);
+        let old = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        with_pen(dc, PS_SOLID, scale(ui, 2), colors.primary, || {
+            Ellipse(dc, lens.left, lens.top, lens.right + 1, lens.bottom + 1);
+        });
+        SelectObject(dc, old);
     }
 }
 

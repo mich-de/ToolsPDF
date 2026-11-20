@@ -16,6 +16,7 @@ const HOST: &str = "github.com";
 const ASSET: &str = "ToolsPDF.exe";
 const MAX_DOWNLOAD: usize = 64 * 1024 * 1024;
 
+#[derive(Clone)]
 pub struct Release {
     pub version: String,
     sha256: [u8; 32],
@@ -29,14 +30,17 @@ pub fn latest() -> Result<Release, String> {
 }
 
 pub fn parse_version_file(text: &str) -> Result<Release, String> {
-    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let mut lines = text.trim_start_matches('\u{feff}').lines().map(str::trim).filter(|l| !l.is_empty());
     let version = lines.next().map(|v| v.trim_start_matches('v').to_string()).filter(|v| parse(v).is_some()).ok_or("version.txt senza versione")?;
     let hex = lines.next().ok_or("version.txt senza impronta")?;
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .filter_map(|i| hex.get(i..i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok()))
-        .collect();
-    let sha256: [u8; 32] = bytes.try_into().map_err(|_| "impronta SHA-256 non valida")?;
+    if hex.len() != 64 || !hex.is_ascii() {
+        return Err("impronta SHA-256 non valida".into());
+    }
+    let mut sha256 = [0u8; 32];
+    for (slot, pair) in sha256.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        let pair = std::str::from_utf8(pair).map_err(|_| "impronta SHA-256 non valida")?;
+        *slot = u8::from_str_radix(pair, 16).map_err(|_| "impronta SHA-256 non valida")?;
+    }
     Ok(Release { version, sha256 })
 }
 
@@ -75,11 +79,14 @@ pub fn install(release: &Release, progress: &dyn Fn(f64)) -> Result<(), String> 
 
 /// All'avvio toglie i resti di un aggiornamento precedente. Se il vecchio processo
 /// non e' ancora chiuso la rimozione fallisce e si riprova la volta dopo.
-pub fn cleanup() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = fs::remove_file(sibling(&exe, ".old"));
-        let _ = fs::remove_file(sibling(&exe, ".new"));
-    }
+/// Vero se c'era la copia .old: questo e' il primo avvio dopo un aggiornamento.
+pub fn cleanup() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let old = sibling(&exe, ".old");
+    let updated = old.exists();
+    let _ = fs::remove_file(&old);
+    let _ = fs::remove_file(sibling(&exe, ".new"));
+    updated
 }
 
 fn sibling(exe: &Path, suffix: &str) -> PathBuf {
@@ -124,9 +131,12 @@ fn get(path: &str, progress: &dyn Fn(f64)) -> Result<Vec<u8>, String> {
         WinHttpSetTimeouts(session.0, 10_000, 10_000, 30_000, 60_000);
         let host = wide(HOST);
         let connect = Handle(WinHttpConnect(session.0, host.as_ptr(), INTERNET_DEFAULT_HTTPS_PORT, 0));
+        if connect.0.is_null() {
+            return Err(offline());
+        }
         let (verb, target) = (wide("GET"), wide(path));
         let request = Handle(WinHttpOpenRequest(connect.0, verb.as_ptr(), target.as_ptr(), null(), null(), null(), WINHTTP_FLAG_SECURE));
-        if connect.0.is_null() || request.0.is_null() {
+        if request.0.is_null() {
             return Err(offline());
         }
         if WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) == 0 || WinHttpReceiveResponse(request.0, null_mut()) == 0 {
@@ -139,6 +149,9 @@ fn get(path: &str, progress: &dyn Fn(f64)) -> Result<Vec<u8>, String> {
             other => return Err(format!("GitHub ha risposto {other}")),
         }
         let total = query_number(request.0, WINHTTP_QUERY_CONTENT_LENGTH).unwrap_or(0) as usize;
+        if total > MAX_DOWNLOAD {
+            return Err("file troppo grande".into());
+        }
         let mut data = Vec::with_capacity(total.min(MAX_DOWNLOAD));
         loop {
             let mut available = 0u32;
@@ -149,17 +162,17 @@ fn get(path: &str, progress: &dyn Fn(f64)) -> Result<Vec<u8>, String> {
                 break;
             }
             let start = data.len();
+            if start.saturating_add(available as usize) > MAX_DOWNLOAD {
+                return Err("file troppo grande".into());
+            }
             data.resize(start + available as usize, 0);
             let mut read = 0u32;
             if WinHttpReadData(request.0, data[start..].as_mut_ptr().cast(), available, &mut read) == 0 {
                 return Err("download interrotto".into());
             }
             data.truncate(start + read as usize);
-            if data.len() > MAX_DOWNLOAD {
-                return Err("file troppo grande".into());
-            }
             if total > 0 {
-                progress(data.len() as f64 / total as f64);
+                progress((data.len() as f64 / total as f64).min(1.0));
             }
         }
         Ok(data)

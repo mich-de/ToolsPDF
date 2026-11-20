@@ -35,24 +35,29 @@ pub(super) struct PageGeometry {
 
 impl PageGeometry {
     pub(super) fn read(doc: &Document, page: ObjectId) -> Option<Self> {
-        let boxed = inherited(doc, page, b"CropBox").or_else(|| inherited(doc, page, b"MediaBox"))?;
-        let Object::Array(values) = boxed else { return None };
-        let mut numbers = Vec::with_capacity(4);
-        for value in &values {
-            let (_, value) = doc.dereference(value).ok()?;
-            numbers.push(value.as_float().ok()? as f64);
-        }
-        if numbers.len() != 4 {
-            return None;
-        }
+        let read_box = |key: &[u8]| -> Option<(f64, f64, f64, f64)> {
+            let Object::Array(values) = inherited(doc, page, key)? else { return None };
+            if values.len() != 4 {
+                return None;
+            }
+            let mut n = [0.0f64; 4];
+            for (slot, value) in n.iter_mut().zip(&values) {
+                let (_, value) = doc.dereference(value).ok()?;
+                *slot = value.as_float().ok()? as f64;
+            }
+            Some((n[0].min(n[2]), n[1].min(n[3]), n[0].max(n[2]), n[1].max(n[3])))
+        };
+        let (x0, y0, x1, y1) = match (read_box(b"MediaBox"), read_box(b"CropBox")) {
+            (Some((mx0, my0, mx1, my1)), Some((cx0, cy0, cx1, cy1))) => {
+                let (ix0, iy0, ix1, iy1) = (mx0.max(cx0), my0.max(cy0), mx1.min(cx1), my1.min(cy1));
+                if ix1 > ix0 && iy1 > iy0 { (ix0, iy0, ix1, iy1) } else { (mx0, my0, mx1, my1) }
+            }
+            (Some(media), None) => media,
+            (None, Some(crop)) => crop,
+            (None, None) => return None,
+        };
         let rotate = inherited(doc, page, b"Rotate").and_then(|o| o.as_i64().ok()).unwrap_or(0).rem_euclid(360);
-        Some(PageGeometry {
-            x0: numbers[0].min(numbers[2]),
-            y0: numbers[1].min(numbers[3]),
-            x1: numbers[0].max(numbers[2]),
-            y1: numbers[1].max(numbers[3]),
-            rotate,
-        })
+        Some(PageGeometry { x0, y0, x1, y1, rotate })
     }
 
     /// Origine in punti e matrice del testo per un punto della pagina diritta.
@@ -201,8 +206,27 @@ fn add_font(doc: &mut Document) -> ObjectId {
 }
 
 /// I codici del testo sono gia' UTF-16: la mappa verso Unicode e' l'identita'.
+/// ISO 32000-1 §9.10.3: in beginbfrange l'incremento vale solo sull'ultimo byte (blocchi da 256, max 100 per sezione).
 fn identity_cmap() -> Vec<u8> {
-    b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo <</Registry (Adobe) /Ordering (UCS) /Supplement 0>> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n1 beginbfrange\n<0000> <FFFF> <0000>\nendbfrange\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n".to_vec()
+    let mut out = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo <</Registry (Adobe) /Ordering (UCS) /Supplement 0>> def\n\
+         /CMapName /Adobe-Identity-UCS def\n\
+         /CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    for chunk_start in (0u16..256).step_by(100) {
+        let chunk_end = (chunk_start + 100).min(256);
+        let _ = writeln!(out, "{} beginbfrange", chunk_end - chunk_start);
+        for hi in chunk_start..chunk_end {
+            let lo_code = hi << 8;
+            let hi_code = lo_code | 0x00FF;
+            let _ = writeln!(out, "<{lo_code:04X}> <{hi_code:04X}> <{lo_code:04X}>");
+        }
+        out.push_str("endbfrange\n");
+    }
+    out.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    out.into_bytes()
 }
 
 fn be16(values: &[i16]) -> Vec<u8> {

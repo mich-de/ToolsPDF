@@ -36,10 +36,12 @@ pub(crate) fn copy_signature(owner: HWND, png: &[u8], image: &RgbaImage) -> bool
         if ok && png_format != 0 {
             ok &= put(png_format, png);
         }
-        // Stessa risoluzione del PNG: in ogni formato la firma ha la stessa misura.
-        let dpi = signature::png_dpi(png).unwrap_or(signature::BASE_DPI);
-        ok &= put(CF_DIBV5, &signature::dib_v5(image, dpi));
-        ok &= put(CF_DIB, &signature::dib_on_white(image, dpi));
+        // Stessa risoluzione del PNG: in ogni formato l'immagine ha la stessa misura.
+        if ok {
+            let dpi = signature::png_dpi(png).unwrap_or(signature::BASE_DPI);
+            ok &= put(CF_DIBV5, &signature::dib_v5(image, dpi));
+            ok &= put(CF_DIB, &signature::dib_on_white(image, dpi));
+        }
         let _ = CloseClipboard();
         ok
     }

@@ -263,7 +263,8 @@ pub(crate) fn handle_key(message: &MSG) -> bool {
     if message.message != WM_KEYDOWN || message.wParam != VK_RETURN as usize || !is_edit(message.hwnd) {
         return false;
     }
-    if message.hwnd == edit_hwnd(E_UNLOCK) {
+    if message.hwnd == edit_hwnd(E_UNLOCK) && facts().view == View::Locked {
+        note("");
         unlock();
         super::panel::invalidate();
     }
@@ -1278,8 +1279,9 @@ fn remember_prefs(stamp: &str) {
     let prefs = TOOLS.with(|t| ToolsPrefs {
         stamp: if stamp.is_empty() { previous.stamp.clone() } else { stamp.to_string() },
         signature: match t.signature.borrow().as_ref() {
-            None => None,
             Some(sig) => sig.path.clone().or_else(|| previous.signature.clone()),
+            None if t.checks.get()[2] => None,
+            None => previous.signature.clone(),
         },
         signature_position: t.signature_position.get(),
         signature_size: t.signature_size.get(),

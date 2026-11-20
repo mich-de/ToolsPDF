@@ -25,7 +25,7 @@ pub fn init_worker_thread() {
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 }
 
-/// Chiede dove salvare un PDF. None se l'utente annulla.
+/// Chiede dove salvare un file (PDF, Word, JPG o PNG secondo il nome proposto). None se l'utente annulla.
 pub fn pick_file(owner: windows_sys::Win32::Foundation::HWND, suggested: &str) -> Option<PathBuf> {
     loop {
         let path = show_save(owner, suggested).ok()??;
@@ -74,8 +74,13 @@ fn show_save(owner: windows_sys::Win32::Foundation::HWND, suggested: &str) -> wi
     unsafe {
         let dialog: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
         // Il tipo di file segue il nome proposto: documento Word o PDF.
-        let (title, extension, filters) = if suggested.to_lowercase().ends_with(".docx") {
+        let lower = suggested.to_lowercase();
+        let (title, extension, filters) = if lower.ends_with(".docx") {
             (w!("Dove vuoi salvare il documento Word?"), w!("docx"), [COMDLG_FILTERSPEC { pszName: w!("Documento Word"), pszSpec: w!("*.docx") }])
+        } else if lower.ends_with(".jpg") {
+            (w!("Dove vuoi salvare la foto?"), w!("jpg"), [COMDLG_FILTERSPEC { pszName: w!("Immagine JPEG"), pszSpec: w!("*.jpg") }])
+        } else if lower.ends_with(".png") {
+            (w!("Dove vuoi salvare la foto?"), w!("png"), [COMDLG_FILTERSPEC { pszName: w!("Immagine PNG"), pszSpec: w!("*.png") }])
         } else {
             (w!("Dove vuoi salvare il PDF?"), w!("pdf"), [COMDLG_FILTERSPEC { pszName: w!("Documento PDF"), pszSpec: w!("*.pdf") }])
         };

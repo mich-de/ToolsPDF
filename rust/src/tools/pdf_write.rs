@@ -8,7 +8,7 @@ pub struct JpegPage {
 }
 
 /// Byte di struttura PDF stimati per pagina.
-pub const PAGE_OVERHEAD: usize = 400;
+pub const PAGE_OVERHEAD: usize = 460;
 
 /// Dimensioni e componenti lette dall'intestazione, senza decodificare.
 pub struct JpegInfo {

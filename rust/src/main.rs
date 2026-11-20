@@ -1,6 +1,7 @@
 //! Tools PDF: barra laterale per comprimere, dividere, unire documenti e renderne selezionabile il testo.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod news;
 mod settings;
 mod tools;
 mod ui;

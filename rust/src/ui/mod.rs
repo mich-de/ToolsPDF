@@ -9,6 +9,8 @@ mod drop_target;
 mod monitors;
 mod paint;
 mod panel;
+mod photo_panel;
+mod scanner_panel;
 mod signatures_panel;
 mod tools_panel;
 mod win;
@@ -41,6 +43,7 @@ use crate::settings::{self, Conversion, Settings, Side};
 use crate::update;
 use crate::tools::edit::{self, Plan};
 use crate::tools::preview::{self, Thumb};
+use crate::tools::scanner::{self, ScannerInfo};
 use crate::tools::{self, location, Callbacks, Destination, Error as ToolError, Kind, Loaded, Operation, Outcome, Source};
 use paint::{FontSet, Palette, ROW_HEIGHT};
 use tools_panel::{DocState, ToolsDoc};
@@ -75,8 +78,9 @@ pub(crate) const ZONE_TEXT: usize = 2;
 pub(crate) const ZONE_WORD: usize = 3;
 pub(crate) const ZONE_TOOLS: usize = 4;
 pub(crate) const ZONE_SIGNATURES: usize = 5;
-pub(crate) const ZONE_JOIN: usize = 6;
-pub(crate) const ZONE_COUNT: usize = 7;
+pub(crate) const ZONE_PHOTO: usize = 6;
+pub(crate) const ZONE_JOIN: usize = 7;
+pub(crate) const ZONE_COUNT: usize = 8;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RowState {
@@ -142,14 +146,31 @@ struct Shared {
     previews: Sender<PreviewJob>,
 }
 
+/// Stato dell'aggiornamento mostrato nel banner della barra e in Info.
+#[derive(Clone)]
+pub(crate) enum UpdateStatus {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(update::Release),
+    Downloading(String),
+    Ready(String),
+    Error(String),
+}
+
 static SHARED: OnceLock<Shared> = OnceLock::new();
 static NEXT_TRAY_ID: AtomicU64 = AtomicU64::new(1);
 /// Versione trovata su GitHub, in attesa della risposta dell'utente.
 static UPDATE_OFFER: Mutex<Option<update::Release>> = Mutex::new(None);
-/// Versioni gia' proposte in questa sessione: non si richiede ogni giorno la stessa.
+/// Stato persistente dell'aggiornamento (per il banner nella barra e il tasto in Info).
+static UPDATE_STATUS: Mutex<UpdateStatus> = Mutex::new(UpdateStatus::Idle);
+/// Versioni gia' proposte con popup in questa sessione: non si richiede ogni giorno la stessa.
 static UPDATE_ASKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Dopo la chiusura si riavvia l'exe aggiornato.
 static RESTART: AtomicBool = AtomicBool::new(false);
+/// Scanner WIA rilevati sul PC in sottofondo.
+static SCANNERS: Mutex<Vec<ScannerInfo>> = Mutex::new(Vec::new());
+static HAS_SCANNER: AtomicBool = AtomicBool::new(false);
 
 /// Elemento sotto il mouse nella barra.
 #[derive(Clone, Copy, PartialEq)]
@@ -158,11 +179,14 @@ pub(crate) enum Hover {
     Close,
     Info,
     Settings,
+    Scanner,
+    UpdateBanner,
     Join,
     Clear,
     JoinZone,
     ToolsZone,
     SignaturesZone,
+    PhotoZone,
     Folder(usize),
 }
 
@@ -210,8 +234,14 @@ pub fn run(files: Vec<OsString>) {
             return;
         }
 
-        update::cleanup();
+        let updated = update::cleanup();
         let settings = settings::load();
+        let show_news = crate::news::should_show(updated, settings::had_file(), settings::seen_version().as_deref(), VERSION);
+        if !show_news && !settings::had_file() {
+            // Al primo uso segna la versione in memoria: se poi l'utente salva le impostazioni,
+            // al secondo avvio non comparira' il popup novita' senza alcun aggiornamento.
+            settings::mark_seen_in_memory(VERSION);
+        }
         tools::set_limit_mb(settings.limit_mb);
         tools::set_always_ocr(settings.always_ocr);
         UI.with(|ui| ui.palette.set(paint::palette_for(settings.theme)));
@@ -238,11 +268,11 @@ pub fn run(files: Vec<OsString>) {
         });
         thread::spawn(move || {
             for job in preview_receiver {
-                match job {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || match job {
                     PreviewJob::Tray(id, source) => make_preview(id, source),
                     PreviewJob::Tools(id, source) => load_tools_doc(id, source),
                     PreviewJob::Unlock(id, password) => unlock_tools_doc(id, &password),
-                }
+                }));
             }
         });
 
@@ -288,7 +318,11 @@ pub fn run(files: Vec<OsString>) {
             shared.hwnd.store(hwnd as isize, Ordering::SeqCst);
         }
         update_dpi(hwnd);
-        register_appbar(hwnd);
+        if settings.reserve {
+            register_appbar(hwnd);
+        } else {
+            position_appbar(hwnd);
+        }
         if let Err(text) = drop_target::register(hwnd, drop_target::Target::Bar) {
             fatal(&text);
             remove_appbar(hwnd);
@@ -300,11 +334,16 @@ pub fn run(files: Vec<OsString>) {
             return;
         }
         ShowWindow(hwnd, SW_SHOWNA);
+        refresh_scanners();
         // Da riga di comando o trascinando sull'exe si comprime.
         let sources = files.into_iter().map(|f| Source::from_path(PathBuf::from(f))).collect();
         on_drop(ZONE_COMPRESS, sources, Vec::new());
         if settings.check_updates {
             start_update_checks();
+        }
+        // Novita': dopo che la barra e' comparsa, dal ciclo dei messaggi.
+        if show_news {
+            PostMessageW(hwnd, WM_UPDATE, WPARAM_NEWS, 0);
         }
 
         let mut message: MSG = std::mem::zeroed();
@@ -326,21 +365,71 @@ pub fn run(files: Vec<OsString>) {
     }
 }
 
-/// Controlla GitHub in sottofondo; se trova una versione nuova la propone sul thread UI.
+/// Vero se sul PC e' stato rilevato almeno uno scanner WIA.
+pub(crate) fn has_scanner() -> bool {
+    HAS_SCANNER.load(Ordering::Relaxed)
+}
+
+pub(crate) fn scanners_list() -> Vec<ScannerInfo> {
+    SCANNERS.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// Cerca gli scanner di sistema in sottofondo: non blocca la barra e mostra l'icona solo se esistono.
+pub(crate) fn refresh_scanners() {
+    thread::spawn(|| {
+        let found = scanner::list_scanners();
+        let count = found.len();
+        HAS_SCANNER.store(count > 0, Ordering::Relaxed);
+        if let Ok(mut list) = SCANNERS.lock() {
+            *list = found;
+        }
+        scanner_panel::on_scanners_refreshed(count);
+        request_repaint();
+    });
+}
+
+/// Invia un PDF appena scansionato in memoria a Testo (OCR) o Comprimi.
+pub(crate) fn send_scanned_pdf(op: Operation, pdf: Vec<u8>) {
+    let Some(shared) = SHARED.get() else { return };
+    let name = scanner::default_name();
+    let source = Source::from_memory(&name, pdf);
+    if let Some(row) = new_row(name) {
+        let _ = shared.jobs.send(Job::One { row, op, source });
+    }
+    request_repaint();
+}
+
+pub(crate) fn update_status() -> UpdateStatus {
+    UPDATE_STATUS.lock().map(|s| s.clone()).unwrap_or(UpdateStatus::Idle)
+}
+
+fn set_update_status(status: UpdateStatus) {
+    if let Ok(mut current) = UPDATE_STATUS.lock() {
+        *current = status;
+    }
+    request_repaint();
+}
+
+/// Controlla GitHub in sottofondo; se trova una versione nuova mostra il banner e propone il download.
 fn start_update_checks() {
     thread::spawn(|| {
         thread::sleep(UPDATE_FIRST_CHECK);
         loop {
             if let Ok(release) = update::latest() {
-                let fresh = update::is_newer(&release.version, VERSION)
-                    && UPDATE_ASKED.lock().is_ok_and(|asked| !asked.contains(&release.version));
-                if fresh {
-                    if let Ok(mut offer) = UPDATE_OFFER.lock() {
-                        *offer = Some(release);
+                if update::is_newer(&release.version, VERSION) {
+                    let already_ready = matches!(update_status(), UpdateStatus::Ready(_) | UpdateStatus::Downloading(_));
+                    if !already_ready {
+                        set_update_status(UpdateStatus::Available(release.clone()));
                     }
-                    let hwnd = main_hwnd();
-                    if !hwnd.is_null() {
-                        unsafe { PostMessageW(hwnd, WM_UPDATE, 0, 0) };
+                    let fresh = UPDATE_ASKED.lock().is_ok_and(|asked| !asked.contains(&release.version));
+                    if fresh && !already_ready {
+                        if let Ok(mut offer) = UPDATE_OFFER.lock() {
+                            *offer = Some(release);
+                        }
+                        let hwnd = main_hwnd();
+                        if !hwnd.is_null() {
+                            unsafe { PostMessageW(hwnd, WM_UPDATE, 0, 0) };
+                        }
                     }
                 }
             }
@@ -349,20 +438,29 @@ fn start_update_checks() {
     });
 }
 
-/// Chiede se scaricare la versione nuova; il download si vede come una riga della barra.
-fn offer_update(hwnd: HWND) {
-    let Some(release) = UPDATE_OFFER.lock().ok().and_then(|mut offer| offer.take()) else { return };
-    if let Ok(mut asked) = UPDATE_ASKED.lock() {
-        asked.push(release.version.clone());
-    }
-    let text = format!(
-        "È disponibile Tools PDF {} (in uso: {VERSION}).\n\nScaricarla adesso da GitHub? La barra in uso continua a funzionare; la nuova versione parte al prossimo avvio.",
-        release.version
-    );
-    if win::message_box(hwnd, &text, APP_TITLE, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST) != IDYES {
+/// Controllo manuale avviato dal pulsante "Cerca aggiornamenti" in Info.
+pub(crate) fn check_updates_now() {
+    if matches!(update_status(), UpdateStatus::Checking | UpdateStatus::Downloading(_)) {
         return;
     }
-    let Some(row) = new_row(format!("Aggiornamento a Tools PDF {}", release.version)) else { return };
+    set_update_status(UpdateStatus::Checking);
+    thread::spawn(|| match update::latest() {
+        Ok(release) if update::is_newer(&release.version, VERSION) => {
+            set_update_status(UpdateStatus::Available(release));
+        }
+        Ok(_) => set_update_status(UpdateStatus::UpToDate),
+        Err(err) => set_update_status(UpdateStatus::Error(err)),
+    });
+}
+
+/// Avvia il download della release gia' rilevata (dal banner, da Info o dal popup).
+pub(crate) fn start_update_download(release: update::Release) {
+    if matches!(update_status(), UpdateStatus::Downloading(_)) {
+        return;
+    }
+    let version = release.version.clone();
+    set_update_status(UpdateStatus::Downloading(version.clone()));
+    let Some(row) = new_row(format!("Aggiornamento a Tools PDF {version}")) else { return };
     UI.with(|ui| ui.scroll.set(0));
     thread::spawn(move || {
         update_row(row, |r| {
@@ -384,11 +482,57 @@ fn offer_update(hwnd: HWND) {
                 }
             }
         });
-        let hwnd = main_hwnd();
-        if result.is_ok() && !hwnd.is_null() {
-            unsafe { PostMessageW(hwnd, WM_UPDATE, 1, 0) };
+        match &result {
+            Ok(()) => {
+                set_update_status(UpdateStatus::Ready(version));
+                let hwnd = main_hwnd();
+                if !hwnd.is_null() {
+                    unsafe { PostMessageW(hwnd, WM_UPDATE, 1, 0) };
+                }
+            }
+            Err(text) => {
+                set_update_status(UpdateStatus::Error(text.clone()));
+            }
         }
     });
+}
+
+/// Azione sul banner della barra o sul pulsante aggiornamento in Info.
+pub(crate) fn handle_update_action(hwnd: HWND) {
+    match update_status() {
+        UpdateStatus::Available(release) => start_update_download(release),
+        UpdateStatus::Ready(_) => offer_restart(hwnd),
+        UpdateStatus::Checking | UpdateStatus::Downloading(_) => {}
+        UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Error(_) => check_updates_now(),
+    }
+}
+
+/// Chiede se scaricare la versione nuova; il download si vede come una riga della barra.
+/// WM_UPDATE con questo wparam: novita' della versione appena installata.
+const WPARAM_NEWS: usize = 2;
+
+/// Popup delle novita', una volta sola per versione.
+fn show_news(hwnd: HWND) {
+    let Some(text) = crate::news::of(VERSION) else { return };
+    let title = format!("Novità di Tools PDF {VERSION}");
+    let body = format!("{text}\n\nTutto è spiegato anche in Info (tasto i in alto nella barra).");
+    win::message_box(hwnd, &body, &title, MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+    let _ = settings::save_seen_version(VERSION);
+}
+
+fn offer_update(hwnd: HWND) {
+    let Some(release) = UPDATE_OFFER.lock().ok().and_then(|mut offer| offer.take()) else { return };
+    if let Ok(mut asked) = UPDATE_ASKED.lock() {
+        asked.push(release.version.clone());
+    }
+    let text = format!(
+        "È disponibile Tools PDF {} (in uso: {VERSION}).\n\nScaricarla adesso da GitHub? La barra in uso continua a funzionare; la nuova versione parte al prossimo avvio.",
+        release.version
+    );
+    if win::message_box(hwnd, &text, APP_TITLE, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST) != IDYES {
+        return;
+    }
+    start_update_download(release);
 }
 
 fn offer_restart(hwnd: HWND) {
@@ -425,10 +569,14 @@ fn appbar_data(hwnd: HWND) -> APPBARDATA {
 }
 
 fn register_appbar(hwnd: HWND) {
+    if !settings::current().reserve {
+        position_appbar(hwnd);
+        return;
+    }
     let mut data = appbar_data(hwnd);
     data.uCallbackMessage = WM_APPBAR_NOTIFY;
-    unsafe { SHAppBarMessage(ABM_NEW, &mut data) };
-    UI.with(|ui| ui.registered.set(true));
+    let ok = unsafe { SHAppBarMessage(ABM_NEW, &mut data) } != 0;
+    UI.with(|ui| ui.registered.set(ok));
     position_appbar(hwnd);
 }
 
@@ -440,34 +588,42 @@ fn remove_appbar(hwnd: HWND) {
     }
 }
 
-/// Riserva la striscia sul lato scelto dello schermo scelto: le finestre massimizzate
-/// si fermano prima. Con piu' schermi, in automatico, si usa il bordo esterno del desktop.
+/// Posiziona la barra sul lato scelto dello schermo scelto: se `reserve` e' attivo riserva
+/// la striscia come appbar; altrimenti sta "sopra le finestre" sull'area di lavoro senza
+/// mai spostare le icone del desktop ne' coprire la taskbar.
 fn position_appbar(hwnd: HWND) {
     let current = settings::current();
     let left_side = current.side == Side::Left;
     let Some(screen) = monitors::target(current.side, current.monitor) else { return };
     // La larghezza segue i DPI dello schermo di destinazione, non di quello attuale.
     let width = LOGICAL_WIDTH * screen.dpi as i32 / 96;
-    let m = screen.rect;
+    let registered = UI.with(|ui| ui.registered.get());
     unsafe {
-        let mut data = appbar_data(hwnd);
-        data.rc = if left_side { rect(m.left, m.top, m.left + width, m.bottom) } else { rect(m.right - width, m.top, m.right, m.bottom) };
-        SHAppBarMessage(ABM_QUERYPOS, &mut data);
-        if left_side {
-            data.rc.right = data.rc.left + width;
+        if registered {
+            let m = screen.rect;
+            let mut data = appbar_data(hwnd);
+            data.rc = if left_side { rect(m.left, m.top, m.left + width, m.bottom) } else { rect(m.right - width, m.top, m.right, m.bottom) };
+            SHAppBarMessage(ABM_QUERYPOS, &mut data);
+            if left_side {
+                data.rc.right = data.rc.left + width;
+            } else {
+                data.rc.left = data.rc.right - width;
+            }
+            SHAppBarMessage(ABM_SETPOS, &mut data);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                data.rc.left,
+                data.rc.top,
+                data.rc.right - data.rc.left,
+                data.rc.bottom - data.rc.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         } else {
-            data.rc.left = data.rc.right - width;
+            let w = screen.work;
+            let x = if left_side { w.left } else { w.right - width };
+            SetWindowPos(hwnd, HWND_TOPMOST, x, w.top, width, w.bottom - w.top, SWP_NOACTIVATE);
         }
-        SHAppBarMessage(ABM_SETPOS, &mut data);
-        SetWindowPos(
-            hwnd,
-            null_mut(),
-            data.rc.left,
-            data.rc.top,
-            data.rc.right - data.rc.left,
-            data.rc.bottom - data.rc.top,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
     }
     panel::reposition();
 }
@@ -478,8 +634,17 @@ pub(crate) fn apply_settings(previous: Settings, current: Settings) {
     tools::set_always_ocr(current.always_ocr);
     UI.with(|ui| ui.palette.set(paint::palette_for(current.theme)));
     let hwnd = main_hwnd();
-    if (previous.side != current.side || previous.monitor != current.monitor) && !hwnd.is_null() {
-        position_appbar(hwnd);
+    if !hwnd.is_null() {
+        if previous.reserve != current.reserve {
+            if current.reserve {
+                register_appbar(hwnd);
+            } else {
+                remove_appbar(hwnd);
+                position_appbar(hwnd);
+            }
+        } else if previous.side != current.side || previous.monitor != current.monitor {
+            position_appbar(hwnd);
+        }
     }
     request_repaint();
 }
@@ -549,7 +714,7 @@ pub(crate) fn on_drop(zone: usize, sources: Vec<Source>, errors: Vec<(String, St
         for source in sources {
             let id = NEXT_TRAY_ID.fetch_add(1, Ordering::Relaxed);
             first_new.get_or_insert(id);
-            let _ = shared.previews.send(PreviewJob::Tray(id, source_copy(&source)));
+            let copy = source_copy(&source);
             let item = TrayItem {
                 id,
                 name: source.name.clone(),
@@ -561,6 +726,7 @@ pub(crate) fn on_drop(zone: usize, sources: Vec<Source>, errors: Vec<(String, St
                 error: None,
             };
             with_tray(|tray| tray.push(item));
+            let _ = shared.previews.send(PreviewJob::Tray(id, copy));
         }
         if let Some(id) = first_new {
             panel::show_join(Some(id));
@@ -596,6 +762,20 @@ pub(crate) fn on_drop(zone: usize, sources: Vec<Source>, errors: Vec<(String, St
             }
         }
         panel::show_signatures();
+    } else if zone == ZONE_PHOTO {
+        let mut sources = sources.into_iter();
+        if let Some(source) = sources.next() {
+            photo_panel::load_dropped(source);
+        }
+        for extra in sources {
+            if let Some(row) = new_row(extra.name) {
+                update_row(row, |r| {
+                    r.state = RowState::Failed;
+                    r.status = "Foto tessera prende una foto alla volta: trascinala dopo".into();
+                });
+            }
+        }
+        panel::show_photo();
     } else {
         let op = match zone {
             ZONE_SPLIT => Operation::Split,
@@ -855,7 +1035,7 @@ fn process_join(row: usize, sources: Vec<Source>) {
             files.push(file);
         }
         let first_stem = Path::new(&files[0].name).file_stem().map_or_else(|| "documento".to_string(), |s| s.to_string_lossy().into_owned());
-        let fixed = fixed_folder(&files[0].name);
+        let fixed = zone_folder(SLOT_JOIN, &files[0].name).or_else(|| fixed_folder(&files[0].name));
         let keep_beside = settings::current().save == settings::Save::Beside && files.iter().all(saved_outside_temp);
         let dest = match (&files[0].path, fixed) {
             (_, Some(dest)) => dest,
@@ -878,9 +1058,38 @@ fn saved_outside_temp(file: &Loaded) -> bool {
     file.path.as_deref().is_some_and(|path| !location::is_temporary(path))
 }
 
-/// Dove salvare senza chiedere: nella cartella fissa, se scelta, oppure accanto all'originale
-/// se sta in una cartella normale. None = si chiede.
-fn beside(path: Option<&Path>, name: &str) -> Option<Destination> {
+/// Posti in settings::ZONE_FOLDERS delle zone che salvano file.
+pub(crate) const SLOT_COMPRESS: usize = 0;
+pub(crate) const SLOT_SPLIT: usize = 1;
+pub(crate) const SLOT_TEXT: usize = 2;
+pub(crate) const SLOT_WORD: usize = 3;
+pub(crate) const SLOT_TOOLS: usize = 4;
+pub(crate) const SLOT_PHOTO: usize = 5;
+pub(crate) const SLOT_JOIN: usize = 6;
+
+fn slot_of(op: Operation) -> usize {
+    match op {
+        Operation::Compress => SLOT_COMPRESS,
+        Operation::Split => SLOT_SPLIT,
+        Operation::Text => SLOT_TEXT,
+        Operation::Word => SLOT_WORD,
+    }
+}
+
+/// Cartella propria della zona, se scelta ed esistente: vince sulla regola generale. Se manca
+/// (altro PC, OneDrive non sincronizzato) vale la regola generale.
+fn zone_folder(slot: usize, name: &str) -> Option<Destination> {
+    let folder = settings::zone_folder(slot).filter(|f| f.is_dir() && !location::is_temporary(f))?;
+    let file = Path::new(name).file_name().map_or_else(|| "documento.pdf".into(), |n| n.to_os_string());
+    Some(Destination::NextTo(folder.join(file)))
+}
+
+/// Dove salvare senza chiedere: nella cartella della zona, se scelta; poi nella cartella fissa,
+/// se scelta, oppure accanto all'originale se sta in una cartella normale. None = si chiede.
+fn beside(slot: usize, path: Option<&Path>, name: &str) -> Option<Destination> {
+    if let Some(dest) = zone_folder(slot, name) {
+        return Some(dest);
+    }
     match settings::current().save {
         settings::Save::Folder => fixed_folder(name),
         settings::Save::Beside => path.filter(|p| !location::is_temporary(p)).map(|p| Destination::NextTo(p.to_path_buf())),
@@ -903,7 +1112,7 @@ fn fixed_folder(name: &str) -> Option<Destination> {
 /// Un file in cartella normale si salva accanto, salvo diversa impostazione (cartella fissa o
 /// chiedi sempre); da Outlook o da una temporanea si chiede, salvo cartella fissa.
 fn destination_for(row: usize, op: Operation, file: &Loaded) -> Result<Destination, ToolError> {
-    if let Some(dest) = beside(file.path.as_deref(), &file.name) {
+    if let Some(dest) = beside(slot_of(op), file.path.as_deref(), &file.name) {
         return Ok(dest);
     }
     update_row(row, |r| r.status = "Scegli dove salvare".into());
@@ -924,7 +1133,7 @@ fn process_tools(row: usize, task: ToolsTask, name: &str, path: Option<PathBuf>,
         r.status = "Avvio…".into();
     });
     let result = (|| {
-        let dest = match beside(path.as_deref(), name) {
+        let dest = match beside(SLOT_TOOLS, path.as_deref(), name) {
             Some(dest) => dest,
             None => {
                 update_row(row, |r| r.status = "Scegli dove salvare".into());
@@ -1051,6 +1260,12 @@ fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Hover {
     if paint::settings_rect(hwnd, ui).contains(x, y) {
         return Hover::Settings;
     }
+    if has_scanner() && paint::scanner_rect(hwnd, ui).contains(x, y) {
+        return Hover::Scanner;
+    }
+    if paint::update_banner_rect(hwnd, ui).is_some_and(|r| r.contains(x, y)) {
+        return Hover::UpdateBanner;
+    }
     let tray = tray_len();
     if paint::join_button(hwnd, ui).contains(x, y) {
         return if tray >= 2 { Hover::Join } else { Hover::Nothing };
@@ -1066,6 +1281,9 @@ fn hit_test(hwnd: HWND, ui: &Ui, x: i32, y: i32) -> Hover {
     }
     if paint::zone_rect(hwnd, ui, ZONE_SIGNATURES).contains(x, y) {
         return Hover::SignaturesZone;
+    }
+    if paint::zone_rect(hwnd, ui, ZONE_PHOTO).contains(x, y) {
+        return Hover::PhotoZone;
     }
     paint::folder_at(hwnd, ui, x, y).map_or(Hover::Nothing, Hover::Folder)
 }
@@ -1083,11 +1301,14 @@ fn on_click(hwnd: HWND, x: i32, y: i32) {
         }
         Hover::Info => panel::toggle(panel::Mode::Info),
         Hover::Settings => panel::toggle(panel::Mode::Settings),
+        Hover::Scanner => panel::toggle(panel::Mode::Scanner),
+        Hover::UpdateBanner => handle_update_action(hwnd),
         Hover::Join => start_join(),
         Hover::Clear => clear_tray(),
         Hover::JoinZone => panel::show_join(None),
         Hover::ToolsZone => panel::toggle(panel::Mode::Tools),
         Hover::SignaturesZone => panel::toggle(panel::Mode::Signatures),
+        Hover::PhotoZone => panel::toggle(panel::Mode::Photo),
         Hover::Folder(index) => {
             let output = with_rows(|rows| rows.get(index).and_then(|r| r.output.clone())).flatten();
             if let Some((path, is_folder)) = output {
@@ -1112,10 +1333,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                 return 0;
             }
             WM_UPDATE => {
-                if wparam == 0 {
-                    offer_update(hwnd);
-                } else {
-                    offer_restart(hwnd);
+                match wparam {
+                    0 => offer_update(hwnd),
+                    WPARAM_NEWS => show_news(hwnd),
+                    _ => offer_restart(hwnd),
                 }
                 return 0;
             }
@@ -1179,18 +1400,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
             WM_APPBAR_NOTIFY => {
                 match wparam as u32 {
                     ABN_POSCHANGED => position_appbar(hwnd),
-                    // Un'app a schermo intero deve poter coprire la barra.
+                    // Un'app a schermo intero deve poter coprire barra e pannello.
                     ABN_FULLSCREENAPP => {
                         let order = if lparam != 0 { HWND_NOTOPMOST } else { HWND_TOPMOST };
                         SetWindowPos(hwnd, order, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        panel::set_topmost(lparam == 0);
                     }
                     _ => {}
                 }
                 return 0;
             }
             WM_ACTIVATE => {
-                let mut data = appbar_data(hwnd);
-                SHAppBarMessage(ABM_ACTIVATE, &mut data);
+                if UI.with(|ui| ui.registered.get()) {
+                    let mut data = appbar_data(hwnd);
+                    SHAppBarMessage(ABM_ACTIVATE, &mut data);
+                }
             }
             WM_WINDOWPOSCHANGED => {
                 if UI.with(|ui| ui.registered.get()) {
@@ -1210,10 +1434,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lpa
                 panel::invalidate();
             }
             other => {
-                // Se Explorer riparte perde le appbar: ci si registra di nuovo.
+                // Se Explorer riparte perde le appbar: ci si registra di nuovo solo se reserve e' attivo.
                 let taskbar = UI.with(|ui| ui.taskbar_msg.get());
                 if taskbar != 0 && other == taskbar {
-                    register_appbar(hwnd);
+                    if settings::current().reserve {
+                        register_appbar(hwnd);
+                    } else {
+                        position_appbar(hwnd);
+                    }
                     return 0;
                 }
             }

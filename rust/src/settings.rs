@@ -51,6 +51,8 @@ pub struct Settings {
     pub theme: Theme,
     /// Numero dello schermo (\\.\DISPLAYn); None sceglie il bordo esterno del desktop.
     pub monitor: Option<u32>,
+    /// Riserva lo spazio sullo schermo come appbar (sposta le icone) oppure sta sopra le finestre.
+    pub reserve: bool,
     /// Controlla su GitHub se c'e' una versione nuova (e chiede prima di scaricarla).
     pub check_updates: bool,
 }
@@ -65,6 +67,7 @@ impl Default for Settings {
             side: Side::Right,
             theme: Theme::System,
             monitor: None,
+            reserve: false,
             check_updates: true,
         }
     }
@@ -74,7 +77,7 @@ impl Settings {
     /// Legge il formato chiave=valore; valori sconosciuti restano predefiniti.
     pub fn parse(text: &str) -> Self {
         let mut settings = Settings::default();
-        for line in text.lines() {
+        for line in text.trim_start_matches('\u{feff}').lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
             match (key.trim(), value.trim()) {
                 ("limite_mb", v) => {
@@ -97,6 +100,8 @@ impl Settings {
                 ("tema", "scuro") => settings.theme = Theme::Dark,
                 ("schermo", "auto") => settings.monitor = None,
                 ("schermo", v) => settings.monitor = v.parse().ok().filter(|n| *n > 0),
+                ("spazio", "riservato") => settings.reserve = true,
+                ("spazio", "sopra") => settings.reserve = false,
                 ("aggiornamenti", "chiedi") => settings.check_updates = true,
                 ("aggiornamenti", "mai") => settings.check_updates = false,
                 _ => {}
@@ -123,10 +128,11 @@ impl Settings {
             Save::Ask => "chiedi_sempre",
         };
         let monitor = self.monitor.map_or_else(|| "auto".to_string(), |n| n.to_string());
+        let space = if self.reserve { "riservato" } else { "sopra" };
         let ocr = if self.always_ocr { "sempre" } else { "solo_testo" };
         let updates = if self.check_updates { "chiedi" } else { "mai" };
         format!(
-            "# Impostazioni di Tools PDF\r\nlimite_mb={}\r\ndove_salvare={save}\r\nconversione={conversion}\r\nocr={ocr}\r\nlato={side}\r\ntema={theme}\r\nschermo={monitor}\r\naggiornamenti={updates}\r\n",
+            "# Impostazioni di Tools PDF\r\nlimite_mb={}\r\ndove_salvare={save}\r\nconversione={conversion}\r\nocr={ocr}\r\nlato={side}\r\ntema={theme}\r\nschermo={monitor}\r\nspazio={space}\r\naggiornamenti={updates}\r\n",
             self.limit_mb
         )
     }
@@ -207,17 +213,101 @@ fn set_output_folder(folder: Option<PathBuf>) {
 }
 
 fn parse_output(text: &str) -> Option<PathBuf> {
+    parse_path(text, OUTPUT_KEY)
+}
+
+/// Percorso della chiave indicata; vuoto = nessuno.
+fn parse_path(text: &str, wanted: &str) -> Option<PathBuf> {
     text.lines()
         .filter_map(|line| line.split_once('='))
-        .find(|(key, _)| key.trim() == OUTPUT_KEY)
+        .find(|(key, _)| key.trim() == wanted)
         .map(|(_, value)| value.trim())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
+fn path_line(key: &str, path: Option<&Path>) -> String {
+    let value = path.map_or_else(String::new, |p| p.display().to_string());
+    format!("{key}={value}\r\n")
+}
+
 fn output_text() -> String {
-    let folder = output_folder().map_or_else(String::new, |p| p.display().to_string());
-    format!("{OUTPUT_KEY}={folder}\r\n")
+    let mut text = path_line(OUTPUT_KEY, output_folder().as_deref());
+    for ((_, key), folder) in ZONE_FOLDERS.iter().zip(zone_folders()) {
+        text += &path_line(key, folder.as_deref());
+    }
+    if let Some(version) = seen_version() {
+        text += &format!("{SEEN_KEY}={version}\r\n");
+    }
+    text
+}
+
+/// Zone che possono avere una cartella di output propria: nome mostrato e chiave nell'ini.
+pub const ZONE_FOLDERS: [(&str, &str); 7] = [
+    ("Comprimi", "cartella_comprimi"),
+    ("Dividi", "cartella_dividi"),
+    ("Testo", "cartella_testo"),
+    ("Word", "cartella_word"),
+    ("Strumenti", "cartella_strumenti"),
+    ("Foto tessera", "cartella_foto"),
+    ("Unisci", "cartella_unisci"),
+];
+pub type ZoneFolders = [Option<PathBuf>; 7];
+
+/// Cartella propria di ogni zona (indice di ZONE_FOLDERS): vince sulla regola generale.
+static ZONES: Mutex<ZoneFolders> = Mutex::new([None, None, None, None, None, None, None]);
+
+pub fn zone_folders() -> ZoneFolders {
+    ZONES.lock().map(|z| z.clone()).unwrap_or_default()
+}
+
+pub fn zone_folder(slot: usize) -> Option<PathBuf> {
+    zone_folders().get(slot).cloned().flatten()
+}
+
+fn set_zone_folders(folders: ZoneFolders) {
+    if let Ok(mut current) = ZONES.lock() {
+        *current = folders;
+    }
+}
+
+fn parse_zones(text: &str) -> ZoneFolders {
+    std::array::from_fn(|k| parse_path(text, ZONE_FOLDERS[k].1))
+}
+
+/// Ultima versione di cui l'utente ha visto le novita'.
+static SEEN: Mutex<Option<String>> = Mutex::new(None);
+const SEEN_KEY: &str = "novita_viste";
+/// Vero se all'avvio c'era gia' un file di impostazioni (non e' la prima volta).
+static HAD_FILE: Mutex<bool> = Mutex::new(false);
+
+pub fn seen_version() -> Option<String> {
+    SEEN.lock().ok().and_then(|v| v.clone())
+}
+
+pub fn had_file() -> bool {
+    HAD_FILE.lock().map(|h| *h).unwrap_or(false)
+}
+
+fn parse_seen(text: &str) -> Option<String> {
+    text.lines().filter_map(|line| line.split_once('=')).find(|(key, _)| key.trim() == SEEN_KEY).map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Segna in memoria la versione vista (senza scrivere su disco al primo uso).
+pub fn mark_seen_in_memory(version: &str) {
+    if let Ok(mut seen) = SEEN.lock() {
+        if seen.is_none() {
+            *seen = Some(version.to_string());
+        }
+    }
+}
+
+/// Segna come viste le novita' di questa versione e riscrive il file.
+pub fn save_seen_version(version: &str) -> Result<PathBuf, String> {
+    if let Ok(mut seen) = SEEN.lock() {
+        *seen = Some(version.to_string());
+    }
+    write_file(&full_text())
 }
 static TOOLS: Mutex<Option<ToolsPrefs>> = Mutex::new(None);
 
@@ -272,28 +362,43 @@ fn appdata_path() -> Option<PathBuf> {
     appdata_dir().map(|dir| dir.join(FILE_NAME))
 }
 
-/// File in uso: quello accanto all'exe se c'e', altrimenti quello in AppData.
+/// File in uso: quello accanto all'exe se c'e' (salvo sia in sola lettura e esista quello in AppData).
 pub fn file_path() -> Option<PathBuf> {
     let portable = portable_path();
-    if portable.as_ref().is_some_and(|p| p.exists()) {
-        return portable;
+    let appdata = appdata_path().filter(|p| p.exists());
+    if let Some(ref p) = portable {
+        if p.exists() {
+            if appdata.is_some() && fs::OpenOptions::new().append(true).open(p).is_err() {
+                return appdata;
+            }
+            return portable;
+        }
     }
-    appdata_path().filter(|p| p.exists()).or(portable)
+    appdata.or(portable)
 }
 
 pub fn load() -> Settings {
-    let text = file_path().and_then(|p| fs::read_to_string(p).ok()).unwrap_or_default();
+    let read = file_path().and_then(|p| fs::read_to_string(p).ok());
+    if let Ok(mut had) = HAD_FILE.lock() {
+        *had = read.is_some();
+    }
+    let text = read.unwrap_or_default();
     let settings = Settings::parse(&text);
+    set_zone_folders(parse_zones(&text));
+    if let Ok(mut seen) = SEEN.lock() {
+        *seen = parse_seen(&text);
+    }
     set_current(settings);
     set_tools_prefs(ToolsPrefs::parse(&text));
     set_output_folder(parse_output(&text));
     settings
 }
 
-/// Salva e rende attive le impostazioni e la cartella fissa. Restituisce il file scritto.
-pub fn save(settings: Settings, folder: Option<PathBuf>) -> Result<PathBuf, String> {
+/// Salva e rende attive le impostazioni, la cartella fissa e quelle delle zone. Restituisce il file scritto.
+pub fn save(settings: Settings, folder: Option<PathBuf>, zones: ZoneFolders) -> Result<PathBuf, String> {
     set_current(settings);
     set_output_folder(folder);
+    set_zone_folders(zones);
     write_file(&full_text())
 }
 
@@ -328,8 +433,11 @@ mod tests {
 
     #[test]
     fn round_trip_keeps_every_choice() {
-        let settings = Settings { limit_mb: 5, save: Save::Folder, conversion: Conversion::Never, always_ocr: false, side: Side::Left, theme: Theme::Dark, monitor: Some(2), check_updates: false };
+        let settings = Settings { limit_mb: 5, save: Save::Folder, conversion: Conversion::Never, always_ocr: false, side: Side::Left, theme: Theme::Dark, monitor: Some(2), reserve: true, check_updates: false };
         assert_eq!(Settings::parse(&settings.to_text()), settings);
+        assert!(!Settings::default().reserve);
+        assert_eq!(Settings::parse("\u{feff}spazio=riservato\naggiornamenti=mai").reserve, true);
+        assert_eq!(Settings::parse("\u{feff}spazio=riservato\naggiornamenti=mai").check_updates, false);
     }
 
     #[test]
@@ -360,6 +468,16 @@ mod tests {
         assert_eq!(Settings::parse(&text), Settings::default());
         assert_eq!(parse_output("cartella_output=\r\n"), None);
         assert_eq!(Settings::parse("dove_salvare=cartella").save, Save::Folder);
+    }
+
+    #[test]
+    fn zone_folders_and_seen_version_are_read_back() {
+        let text = format!("{}cartella_word=D:\\Word\r\ncartella_foto= \r\nnovita_viste=1.2.0\r\n", Settings::default().to_text());
+        let zones = parse_zones(&text);
+        assert_eq!(zones[3], Some(PathBuf::from(r"D:\Word")));
+        assert!(zones.iter().enumerate().all(|(k, z)| k == 3 || z.is_none()));
+        assert_eq!(parse_seen(&text).as_deref(), Some("1.2.0"));
+        assert_eq!(path_line("cartella_dividi", None), "cartella_dividi=\r\n");
     }
 
     #[test]

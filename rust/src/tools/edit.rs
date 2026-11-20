@@ -84,11 +84,20 @@ pub fn is_protected(data: &[u8]) -> bool {
 
 /// Toglie la password: restituisce lo stesso PDF in chiaro.
 pub fn unlock(data: &[u8], password: &str) -> Result<Vec<u8>, Error> {
-    // Il caricamento con password prova prima quella vuota e toglie la cifratura: la password
-    // data si verifica sul documento ancora cifrato, caricato senza.
-    let locked = Document::load_mem(data).map_err(|e| keep_text::load_error(&e))?;
-    if locked.is_encrypted() && locked.authenticate_password(password).is_err() {
+    if password.is_empty() && is_protected(data) {
         return Err(Error::msg("password errata"));
+    }
+    // Se il PDF si apre senza password (solo owner-password), verifichiamo la password prima
+    // che load_mem_with_options provi la password vuota. Se invece load_mem fallisce per
+    // cifratura degli object stream (/ObjStm, PDF 1.5+), passiamo direttamente al caricamento con password.
+    match Document::load_mem(data) {
+        Ok(locked) => {
+            if locked.is_encrypted() && locked.authenticate_password(password).is_err() {
+                return Err(Error::msg("password errata"));
+            }
+        }
+        Err(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_)) => {}
+        Err(e) => return Err(keep_text::load_error(&e)),
     }
     let mut doc = Document::load_mem_with_options(data, lopdf::LoadOptions::with_password(password)).map_err(|_| Error::msg("password errata"))?;
     strip_encryption(&mut doc);
@@ -234,7 +243,8 @@ pub fn save_extract(dest: &Destination, data: &[u8], plan: &Plan, selected: &[us
         progress(0.2, "Estrazione delle pagine…");
         let out = extract(data, plan, selected)?;
         let output = save_as(dest, "_estratto", "pdf", &out, quiet(progress))?;
-        Ok(Outcome { output, is_folder: false, summary: format!("{} estratte", pages_label(selected.len())) })
+        let summary = if selected.len() == 1 { "1 pagina estratta".into() } else { format!("{} pagine estratte", selected.len()) };
+        Ok(Outcome { output, is_folder: false, summary })
     })
 }
 
@@ -312,15 +322,20 @@ fn add_overlays(doc: &mut Document, pages: &[ObjectId], plan: &Plan) -> Result<(
         let mut content = format!("q {} {} {} {} {} {} cm\n", m[0], m[1], m[2], m[3], fmt(m[4]), fmt(m[5]));
         let mut resources: Vec<(&[u8], &[u8], ObjectId)> = Vec::new();
 
+        let mut sig_name: Option<(Vec<u8>, ObjectId)> = None;
         if let Some(((image, image_w, image_h), sig, on_page)) = &signature {
             if *on_page == index {
+                let res_name = unique_xobject_name(doc, page, SIGNATURE_IMAGE);
                 let (w, h) = signature_size(*image_w, *image_h, sig.size, width, height);
                 let (col, row) = (f64::from(sig.position % 3), f64::from((sig.position / 3).min(2)));
                 let x = PAGE_MARGIN + col * (width - 2.0 * PAGE_MARGIN - w).max(0.0) / 2.0;
                 let y = height - PAGE_MARGIN - h - row * (height - 2.0 * PAGE_MARGIN - h).max(0.0) / 2.0;
-                let _ = writeln!(content, "q {} 0 0 {} {} {} cm /{} Do Q", fmt(w), fmt(h), fmt(x), fmt(y), name(SIGNATURE_IMAGE));
-                resources.push((b"XObject", SIGNATURE_IMAGE, *image));
+                let _ = writeln!(content, "q {} 0 0 {} {} {} cm /{} Do Q", fmt(w), fmt(h), fmt(x), fmt(y), name(&res_name));
+                sig_name = Some((res_name, *image));
             }
+        }
+        if let Some((res_name, image)) = &sig_name {
+            resources.push((b"XObject", res_name.as_slice(), *image));
         }
         if plan.numbers {
             let text = format!("Pagina {} di {total}", index + 1);
@@ -424,6 +439,29 @@ fn signature_object(doc: &mut Document, data: &[u8]) -> Result<(ObjectId, u32, u
     let mut stream = Stream::new(dict, jpeg);
     stream.allows_compression = false;
     Ok((doc.add_object(stream), w, h))
+}
+
+/// Nome XObject univoco sulla pagina: evita che una seconda firma sovrascriva la prima.
+fn unique_xobject_name(doc: &Document, page: ObjectId, base: &[u8]) -> Vec<u8> {
+    let existing = inherited(doc, page, b"Resources").and_then(|res| match res {
+        Object::Dictionary(dict) => dict.get(b"XObject").ok().and_then(|x| doc.dereference(x).ok()).and_then(|(_, o)| match o {
+            Object::Dictionary(d) => Some(d.clone()),
+            _ => None,
+        }),
+        _ => None,
+    });
+    let Some(xobjects) = existing else { return base.to_vec() };
+    if !xobjects.has(base) {
+        return base.to_vec();
+    }
+    let prefix = name(base);
+    for i in 2..10_000u32 {
+        let candidate = format!("{prefix}{i}").into_bytes();
+        if !xobjects.has(&candidate) {
+            return candidate;
+        }
+    }
+    base.to_vec()
 }
 
 fn base_font(base: &[u8]) -> Dictionary {
