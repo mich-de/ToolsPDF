@@ -220,6 +220,25 @@ pub fn pages_to_pdf(raw_pages: &[Vec<u8>], dpi: u32) -> Result<Vec<u8>, Error> {
     pdf_write::write_jpeg_pdf(&pages).ok_or_else(|| Error::msg("impossibile assemblare il PDF della scansione"))
 }
 
+/// Anteprima BGRA (righe dall'alto) di una pagina scansionata, adattata dentro box_w x box_h.
+/// Serve al pannello Scanner per mostrare la pagina in grande prima di inviarla.
+pub fn page_preview(raw: &[u8], box_w: u32, box_h: u32) -> Option<super::preview::Thumb> {
+    if box_w == 0 || box_h == 0 {
+        return None;
+    }
+    let image = imaging::decode_rgb(raw).ok()?;
+    let (w, h) = (image.width().max(1), image.height().max(1));
+    let ratio = (f64::from(box_w) / f64::from(w)).min(f64::from(box_h) / f64::from(h));
+    let tw = ((f64::from(w) * ratio) as u32).max(1);
+    let th = ((f64::from(h) * ratio) as u32).max(1);
+    let small = image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
+    let mut bgra = Vec::with_capacity((tw * th * 4) as usize);
+    for pixel in small.pixels() {
+        bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
+    Some(super::preview::Thumb { width: tw, height: th, bgra })
+}
+
 /// Nome predefinito per una scansione: scansione_AAAAMMGG_HHMMSS.pdf.
 pub fn default_name() -> String {
     let mut now: SYSTEMTIME = unsafe { std::mem::zeroed() };

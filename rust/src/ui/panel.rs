@@ -26,6 +26,8 @@ use crate::tools::preview::Thumb;
 use crate::tools::Source;
 
 const WIDTH: i32 = 340;
+/// Lo Scanner ha bisogno di spazio per l'anteprima grande accanto ai comandi.
+const WIDTH_SCANNER: i32 = 640;
 pub(super) const HEADER: i32 = 48;
 /// Zona di rilascio del pannello Unisci: i file vanno nel vassoio.
 const DROP_JOIN: usize = 2;
@@ -395,7 +397,7 @@ pub(crate) fn reposition() {
     }
     let mut bar_rect = rect(0, 0, 0, 0);
     unsafe { GetWindowRect(bar, &mut bar_rect) };
-    let width = UI.with(|ui| scale(ui, WIDTH));
+    let width = UI.with(|ui| scale(ui, if mode() == Mode::Scanner { WIDTH_SCANNER } else { WIDTH }));
     let x = if settings::current().side == Side::Left { bar_rect.right } else { bar_rect.left - width };
     let screen = monitors::containing(&bar_rect);
     let x = screen.map_or(x, |m| x.clamp(m.rect.left, (m.rect.right - width).max(m.rect.left)));

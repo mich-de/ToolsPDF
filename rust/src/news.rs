@@ -3,6 +3,9 @@
 
 /// Versione e novita', la piu' recente per prima.
 const NEWS: &[(&str, &str)] = &[(
+    "1.5.0",
+    "• Scanner: la pagina acquisita si vede in grande accanto ai comandi, prima di inviarla a Testo (OCR) o Comprimi.\n",
+), (
     "1.4.0",
     "• Spazio sullo schermo: ora la barra si apre \"Sopra le finestre\" senza spostare le icone del desktop (modificabile in Impostazioni).\n\
      • Scanner di sistema: se sul PC è collegato uno scanner WIA, compare l'icona in alto per scansionare (vetro o alimentatore ADF multipagina) direttamente in Testo (OCR) o Comprimi.\n\

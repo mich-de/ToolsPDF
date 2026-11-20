@@ -7,7 +7,7 @@ use std::thread;
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
 
-use super::paint::{client_rect, draw_text, fill_round_rect, outline, paint_button, text_height, with_pen, MARGIN};
+use super::paint::{bgra_info, client_rect, draw_text, fill_round_rect, outline, paint_button, text_height, with_pen, MARGIN};
 use super::panel::HEADER;
 use super::signatures_panel::popup;
 use super::win::{rect, RectExt};
@@ -44,6 +44,16 @@ struct ScanState {
     busy: bool,
     note: String,
     note_err: bool,
+    /// Anteprima grande dell'ultima pagina, con la misura del riquadro per cui è stata calcolata.
+    preview: Option<PreviewImage>,
+}
+
+/// Anteprima già scalata per il riquadro: si ricalcola solo se cambia pagina o misura.
+struct PreviewImage {
+    index: usize,
+    box_w: i32,
+    box_h: i32,
+    thumb: crate::tools::preview::Thumb,
 }
 
 impl Default for ScanState {
@@ -55,6 +65,7 @@ impl Default for ScanState {
             busy: false,
             note: String::new(),
             note_err: false,
+            preview: None,
         }
     }
 }
@@ -85,67 +96,77 @@ struct Layout {
     send_text: RECT,
     send_compress: RECT,
     note: RECT,
+    /// Anteprima grande della pagina acquisita; vuota se il pannello è stretto.
+    preview: RECT,
 }
 
 fn layout(hwnd: HWND, ui: &Ui) -> Layout {
     let s = |v| scale(ui, v);
     let client = client_rect(hwnd);
     let (left, right) = (s(MARGIN), client.right - s(MARGIN));
-    let w = right - left;
+    // Due colonne: comandi a sinistra, anteprima grande a destra.
+    let two_cols = right - left >= s(480);
+    let ctl_right = if two_cols { left + s(300) } else { right };
+    let w = ctl_right - left;
     let mut y = s(HEADER) + s(MARGIN);
 
-    let dev_label = rect(left, y, right, y + s(LABEL));
+    let dev_label = rect(left, y, ctl_right, y + s(LABEL));
     y = dev_label.bottom + s(2);
     let refresh_w = s(78);
-    let device = rect(left, y, right - refresh_w - s(6), y + s(FIELD));
-    let refresh = rect(device.right + s(6), y, right, y + s(FIELD));
+    let device = rect(left, y, ctl_right - refresh_w - s(6), y + s(FIELD));
+    let refresh = rect(device.right + s(6), y, ctl_right, y + s(FIELD));
     y = device.bottom + s(12);
 
-    let src_label = rect(left, y, right, y + s(LABEL));
+    let src_label = rect(left, y, ctl_right, y + s(LABEL));
     y = src_label.bottom + s(2);
-    let mid = (left + right) / 2;
+    let mid = (left + ctl_right) / 2;
     let src_flatbed = rect(left, y, mid - s(3), y + s(CHOICE_H));
-    let src_feeder = rect(mid + s(3), y, right, y + s(CHOICE_H));
+    let src_feeder = rect(mid + s(3), y, ctl_right, y + s(CHOICE_H));
     y = src_flatbed.bottom + s(12);
 
-    let col_label = rect(left, y, right, y + s(LABEL));
+    let col_label = rect(left, y, ctl_right, y + s(LABEL));
     y = col_label.bottom + s(2);
     let third = w / 3;
     let col_choices = [
         rect(left, y, left + third - s(3), y + s(CHOICE_H)),
         rect(left + third + s(2), y, left + 2 * third - s(2), y + s(CHOICE_H)),
-        rect(left + 2 * third + s(3), y, right, y + s(CHOICE_H)),
+        rect(left + 2 * third + s(3), y, ctl_right, y + s(CHOICE_H)),
     ];
     y = col_choices[0].bottom + s(12);
 
-    let dpi_label = rect(left, y, right, y + s(LABEL));
+    let dpi_label = rect(left, y, ctl_right, y + s(LABEL));
     y = dpi_label.bottom + s(2);
     let dpi_choices = [
         rect(left, y, left + third - s(3), y + s(CHOICE_H)),
         rect(left + third + s(2), y, left + 2 * third - s(2), y + s(CHOICE_H)),
-        rect(left + 2 * third + s(3), y, right, y + s(CHOICE_H)),
+        rect(left + 2 * third + s(3), y, ctl_right, y + s(CHOICE_H)),
     ];
     y = dpi_choices[0].bottom + s(14);
 
-    let acquire = rect(left, y, right, y + s(BUTTON));
+    let acquire = rect(left, y, ctl_right, y + s(BUTTON));
     y = acquire.bottom + s(10);
 
-    let status_box = rect(left, y, right, y + s(44));
+    let status_box = rect(left, y, ctl_right, y + s(44));
     y = status_box.bottom + s(6);
     let remove_last = rect(left, y, mid - s(3), y + s(SMALL_BUTTON));
-    let clear_pages = rect(mid + s(3), y, right, y + s(SMALL_BUTTON));
+    let clear_pages = rect(mid + s(3), y, ctl_right, y + s(SMALL_BUTTON));
     y = remove_last.bottom + s(16);
 
-    let send_text = rect(left, y, right, y + s(BUTTON));
+    let send_text = rect(left, y, ctl_right, y + s(BUTTON));
     y = send_text.bottom + s(8);
-    let send_compress = rect(left, y, right, y + s(BUTTON));
+    let send_compress = rect(left, y, ctl_right, y + s(BUTTON));
     y = send_compress.bottom + s(12);
 
-    let note = rect(left, y, right, (client.bottom - s(MARGIN)).max(y + s(40)));
+    let note = rect(left, y, ctl_right, (client.bottom - s(MARGIN)).max(y + s(40)));
+    let preview = if two_cols {
+        rect(ctl_right + s(14), s(HEADER) + s(MARGIN), right, client.bottom - s(MARGIN))
+    } else {
+        rect(0, 0, 0, 0)
+    };
     Layout {
         dev_label, device, refresh, src_label, src_flatbed, src_feeder,
         col_label, col_choices, dpi_label, dpi_choices,
-        acquire, status_box, remove_last, clear_pages, send_text, send_compress, note,
+        acquire, status_box, remove_last, clear_pages, send_text, send_compress, note, preview,
     }
 }
 
@@ -249,6 +270,58 @@ pub(super) fn paint(dc: HDC, hwnd: HWND, ui: &Ui, _client: RECT, hover: ScanHit)
         let h = text_height(dc, &note, l.note.right - l.note.left, fonts.small);
         draw_text(dc, &note, rect(l.note.left, l.note.top, l.note.right, l.note.top + h), fonts.small, if note_err { colors.err } else { colors.ok }, DT_WORDBREAK | DT_NOPREFIX);
     }
+
+    paint_preview(dc, ui, l.preview);
+}
+
+/// Anteprima grande dell'ultima pagina acquisita, dentro il riquadro a destra.
+fn paint_preview(dc: HDC, ui: &Ui, area: RECT) {
+    let s = |v| scale(ui, v);
+    if area.right - area.left < s(120) || area.bottom - area.top < s(120) {
+        return;
+    }
+    let colors = ui.palette.get();
+    let fonts = ui.fonts.get();
+    fill_round_rect(dc, area, s(6), colors.card);
+    with_pen(dc, PS_SOLID, 1, colors.border, || outline(dc, area.left, area.top, area.right - 1, area.bottom - 1));
+
+    let inner = rect(area.left + s(10), area.top + s(10), area.right - s(10), area.bottom - s(10));
+    let label_h = s(22);
+    let box_rect = rect(inner.left, inner.top, inner.right, inner.bottom - label_h);
+
+    with_state(|st| {
+        let Some((raw, _)) = st.pages.last() else {
+            draw_text(dc, "Acquisisci una pagina per vederla qui in grande.", inner, fonts.small, colors.muted, DT_WORDBREAK | DT_NOPREFIX);
+            return;
+        };
+        let (box_w, box_h) = ((box_rect.right - box_rect.left).max(1), (box_rect.bottom - box_rect.top).max(1));
+        let index = st.pages.len() - 1;
+        let stale = match &st.preview {
+            Some(p) => p.index != index || p.box_w != box_w || p.box_h != box_h,
+            None => true,
+        };
+        if stale {
+            st.preview = scanner::page_preview(raw, box_w as u32, box_h as u32)
+                .map(|thumb| PreviewImage { index, box_w, box_h, thumb });
+        }
+        let Some(preview) = st.preview.as_ref() else {
+            draw_text(dc, "Anteprima non disponibile per questa pagina.", inner, fonts.small, colors.err, DT_WORDBREAK | DT_NOPREFIX);
+            return;
+        };
+        let thumb = &preview.thumb;
+        let (tw, th) = (thumb.width as i32, thumb.height as i32);
+        if tw <= 0 || th <= 0 {
+            return;
+        }
+        let x = box_rect.left + ((box_w - tw) / 2).max(0);
+        let y = box_rect.top + ((box_h - th) / 2).max(0);
+        let info = bgra_info(tw, th);
+        unsafe {
+            StretchDIBits(dc, x, y, tw, th, 0, 0, tw, th, thumb.bgra.as_ptr().cast(), &info, DIB_RGB_COLORS, SRCCOPY);
+        }
+        let label = format!("Pagina {} di {}", index + 1, st.pages.len());
+        draw_text(dc, &label, rect(inner.left, box_rect.bottom, inner.right, inner.bottom), fonts.small, colors.muted, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+    });
 }
 
 fn paint_choice(dc: HDC, ui: &Ui, r: RECT, label: &str, selected: bool, hover: bool) {
@@ -276,10 +349,12 @@ pub(super) fn on_click(hwnd: HWND, ui: &Ui, hit: ScanHit) {
         ScanHit::Acquire => start_scan(None),
         ScanHit::RemoveLast => with_state(|st| {
             st.pages.pop();
+            st.preview = None;
             st.note.clear();
         }),
         ScanHit::ClearPages => with_state(|st| {
             st.pages.clear();
+            st.preview = None;
             st.note.clear();
         }),
         ScanHit::SendText => send_or_scan(Operation::Text),
@@ -338,6 +413,7 @@ fn start_scan(send_after: Option<Operation>) {
                 if let Some(op) = send_after {
                     let all_pages = with_state(|st| {
                         st.busy = false;
+                        st.preview = None;
                         let mut combined = std::mem::take(&mut st.pages);
                         combined.extend(raw_pages.into_iter().map(|b| (b, dpi)));
                         st.note = format!("{} inviate alla barra.", page_word(combined.len()));
@@ -348,6 +424,7 @@ fn start_scan(send_after: Option<Operation>) {
                 } else {
                     with_state(|st| {
                         st.busy = false;
+                        st.preview = None;
                         st.pages.extend(raw_pages.into_iter().map(|b| (b, dpi)));
                         st.note = format!("Aggiunte {} (totale: {}).", page_word(added), st.pages.len());
                         st.note_err = false;
